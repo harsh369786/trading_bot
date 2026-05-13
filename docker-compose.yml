@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: nse_bot_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    restart: always
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: nse_bot_postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: trading_bot
+      POSTGRES_USER: bot_user
+      POSTGRES_PASSWORD: bot_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: always
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: nse_bot_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - postgres
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: always
+
+volumes:
+  redis_data:
+  postgres_data:
+  grafana_data:

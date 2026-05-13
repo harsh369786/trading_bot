@@ -1,0 +1,6 @@
+{
+    "equity_min_buy_confidence": 0.72,
+    "equity_min_sell_confidence": 0.7,
+    "currency_min_quant_score": 70,
+    "last_updated": "2026-05-11T11:42:00"
+}

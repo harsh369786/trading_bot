@@ -1,0 +1,92 @@
+broker:
+  primary: "angelone"               # or "dhan", "angelone", "fyers", "upstox"
+  api_key: ""                       # from .env
+  access_token: ""                  # from .env
+  fallback: "dhan"
+
+paper_mode: true                    # ALWAYS start true; set TRADING_MODE=live in .env to override
+
+execution:
+  cost_per_order_inr: 22            # ₹20 brokerage + ₹2 exchange/SEBI (flat-fee brokers)
+  cost_fraction_per_side: 0.0003    # secondary estimate for large notional positions
+
+capital:
+  equity_total: 50000
+  currency_total: 25000
+  risk_per_trade_pct: 1.0           # 1% of capital per trade (full size, uncorrelated pair)
+  risk_per_trade_correlated_pct: 0.65  # used when NIFTY+BANKNIFTY are open simultaneously
+  max_open_trades_equity: 2
+  max_open_trades_currency: 2
+
+instruments:
+  equity: ["NIFTY", "BANKNIFTY", "RELIANCE", "HDFCBANK"]
+  currency: ["USDINR", "EURINR"]
+  correlated_pairs:                 # skip second signal if abs(corr) > threshold
+    - ["NIFTY", "BANKNIFTY"]
+  correlation_window: 20            # bars used to compute rolling correlation
+  correlation_threshold: 0.75      # above this → treat as one position, use correlated risk %
+
+equity_signal:
+  min_buy_confidence: 0.62          # raised from 0.40 — filters near-random signals
+  min_sell_confidence: 0.62         # raised from 0.40
+  min_relative_volume: 0.7
+  max_vix: 20.0
+
+currency_signal:
+  conditions_required: 4
+  min_quant_score: 70
+  min_adx: 20                       # raised from 13 — only trade genuine trend momentum
+  max_sl_paise: 28                  # raised from 20 — aligns with ATR-derived SL on USDINR
+  min_rr: 2.5
+  min_volume_ratio: 0.7
+
+risk:
+  daily_loss_limit_r: 3
+  consecutive_loss_limit: 3
+  intraday_drawdown_limit_pct: 5.0
+  atr_sl_multiplier: 2.0            # raised from 1.5 — reduces premature SL hits on NSE volatility
+  rr_ratio: 2.5
+  max_vix_spike: 25.0
+  currency_max_daily_loss_inr: 750  # tightened from 1500 (was 6% of currency capital; now 3%)
+  currency_max_daily_trades: 5
+
+model:
+  # Session-aware model blending — avoids feeding LSTM flat/choppy data
+  weights_by_session:
+    open_drive:                     # 09:15–11:30: momentum readable, balanced blend
+      xgb: 0.55
+      lstm: 0.45
+    chop_zone:                      # 11:30–13:30: LSTM struggles without trend; lean on XGB
+      xgb: 0.80
+      lstm: 0.20
+    trend_window:                   # 14:30–close: sustained moves favour LSTM
+      xgb: 0.45
+      lstm: 0.55
+  retrain_schedule: "weekly"
+
+adaptive_learning:
+  min_trades_before_change: 40      # raised from 15 — 40+ gives statistically stable estimates
+  apply_changes: "next_session_only"
+
+latency:
+  target_ms: 300
+
+session:
+  market_open: "09:15"
+  noise_window_end: "09:30"
+  chop_zone_start: "11:30"          # NO equity signals generated inside chop zone
+  chop_zone_end: "13:30"
+  trend_window_start: "14:30"
+  currency_cutoff: "15:00"
+  equity_cutoff: "15:15"
+
+notifications:
+  channel: ""                       # or "email", "whatsapp", "telegram"
+  telegram_token: ""                # from .env
+  telegram_chat_id: ""             # from .env
+
+logging:
+  console_level: "SUCCESS"         # SUCCESS, INFO, DEBUG, WARNING, ERROR
+  file_level: "DEBUG"
+  retention_days: 45               # raised from 10 — covers full month + buffer for analysis
+  max_file_size_mb: 50
