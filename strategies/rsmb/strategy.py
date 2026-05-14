@@ -36,7 +36,7 @@ from tracking.signal_logger import SignalLogger
 RSMB_UNIVERSE = [
     "RELIANCE", "HDFCBANK", "INFY", "TCS", "ICICIBANK",
     "SBIN", "AXISBANK", "KOTAKBANK", "LT", "WIPRO",
-    "BAJFINANCE", "TATAMOTORS", "TATASTEEL", "ADANIPORTS",
+    "BAJFINANCE", "TMPV", "TATASTEEL", "ADANIPORTS",
 ]
 
 
@@ -207,7 +207,7 @@ class RSMBStrategy(BaseStrategy):
 
     def on_price_update(self, symbol: str, price: float) -> None:
         """Forward price to position manager for SL/T1/T2 monitoring."""
-        events = self._position_manager.on_price_update(price)
+        events = self._position_manager.on_price_update(price, symbol=symbol)
         if events:
             for pos_id, event in events:
                 logger.info(f"RSMB position {pos_id}: {event} @ {price:.2f}")

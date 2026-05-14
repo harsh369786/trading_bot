@@ -9,6 +9,7 @@ class RiskManagerAgent:
     def __init__(self, config: dict):
         self.config = config
         self.max_sl_paise = config.get("currency_signal", {}).get("max_sl_paise", 20) / 100.0
+        self.max_lots = int(config.get("currency_signal", {}).get("max_lots", 3))
 
     def calculate_risk_params(self, row: dict, side: str) -> dict:
         """
@@ -44,7 +45,7 @@ class RiskManagerAgent:
         else:
             lots = 1
             
-        lots = max(1, min(lots, 50)) # Cap at 50 lots maximum
+        lots = max(1, min(lots, self.max_lots))
         
         return {
             "entry": entry,

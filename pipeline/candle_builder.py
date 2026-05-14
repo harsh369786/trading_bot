@@ -1,5 +1,9 @@
 import asyncio
-from datetime import datetime, timedelta
+import json
+import os
+import time as time_module
+import uuid
+from datetime import datetime, time, timedelta
 from typing import Dict, List
 
 import pandas as pd
@@ -21,11 +25,15 @@ class CandleBuilder:
         self.order_manager = order_manager
         self.rsmb_strategy = rsmb_strategy
         self.paper_engine = paper_engine
+        self.candle_snapshot_path = config.get("dashboard", {}).get(
+            "candle_snapshot_path", "data/candle_snapshot.json"
+        )
         self.tick_data: Dict[str, List[dict]] = {sym: [] for sym in self.symbols}
         self.candles: Dict[str, Dict[str, pd.DataFrame]] = {
             sym: {tf: pd.DataFrame() for tf in self.timeframes} for sym in self.symbols
         }
         self._load_history()
+        self._write_candle_snapshot()
 
     def _load_history(self):
         """Preload recent candles from parquet so indicators have warm-up data."""
@@ -65,6 +73,83 @@ class CandleBuilder:
         minutes = 60 if timeframe == "1h" else int(timeframe.replace("min", ""))
         return dt.replace(second=0, microsecond=0) - timedelta(minutes=dt.minute % minutes)
 
+    def _write_candle_snapshot(self):
+        """Persist latest candles for dashboard/runtime inspection."""
+        snapshot = {
+            "updated_at": datetime.now(pytz.timezone("Asia/Kolkata")).isoformat(),
+            "symbols": {},
+        }
+        for symbol, by_tf in self.candles.items():
+            snapshot["symbols"][symbol] = {}
+            for tf, df in by_tf.items():
+                if df.empty:
+                    snapshot["symbols"][symbol][tf] = []
+                    continue
+                out = df.tail(20).copy()
+                if out.index.tz is None:
+                    out.index = out.index.tz_localize("Asia/Kolkata")
+                else:
+                    out.index = out.index.tz_convert("Asia/Kolkata")
+                out = out.reset_index(names="timestamp")
+                out["timestamp"] = out["timestamp"].astype(str)
+                snapshot["symbols"][symbol][tf] = out.to_dict("records")
+
+        snapshot_path = getattr(self, "candle_snapshot_path", "data/candle_snapshot.json")
+        os.makedirs(os.path.dirname(snapshot_path) or ".", exist_ok=True)
+        tmp_path = f"{snapshot_path}.{uuid.uuid4().hex}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, indent=2, default=str)
+            for attempt in range(3):
+                try:
+                    os.replace(tmp_path, snapshot_path)
+                    break
+                except PermissionError:
+                    if attempt == 2:
+                        raise
+                    time_module.sleep(0.05)
+        except Exception as exc:
+            logger.warning(f"Failed to write candle snapshot: {exc}")
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+
+    def _is_live_session_close(self, symbol: str, closed_ts, latest_ts) -> bool:
+        """
+        Return True only when a candle close is from the same live session as the
+        newest tick being processed. Historical preload can otherwise make a
+        restart look like a candle close from yesterday.
+        """
+        if closed_ts is None or latest_ts is None:
+            return False
+
+        ist = pytz.timezone("Asia/Kolkata")
+        closed_ts = pd.Timestamp(closed_ts)
+        latest_ts = pd.Timestamp(latest_ts)
+        if closed_ts.tzinfo is None:
+            closed_ts = closed_ts.tz_localize(ist)
+        else:
+            closed_ts = closed_ts.tz_convert(ist)
+        if latest_ts.tzinfo is None:
+            latest_ts = latest_ts.tz_localize(ist)
+        else:
+            latest_ts = latest_ts.tz_convert(ist)
+
+        if closed_ts.date() != latest_ts.date():
+            logger.debug(
+                f"Skipping stale candle trigger for {symbol}: "
+                f"closed={closed_ts}, latest_tick={latest_ts}"
+            )
+            return False
+
+        currency_symbols = set(self.config.get("instruments", {}).get("currency", []))
+        market_close = time(17, 0) if symbol in currency_symbols else time(15, 30)
+        market_open = time(9, 15)
+        closed_time = closed_ts.time()
+        return market_open <= closed_time < market_close
+
     async def _process_ticks_to_candles(self, symbol: str, ticks: List[dict]):
         """Aggregate ticks into OHLCV candles across multiple timeframes."""
         if not ticks:
@@ -83,6 +168,16 @@ class CandleBuilder:
         df_ticks = df_ticks.sort_values("timestamp")
         if df_ticks.empty:
             return
+
+        latest_ltp = pd.to_numeric(df_ticks["ltp"], errors="coerce").dropna()
+        if not latest_ltp.empty:
+            latest_price = float(latest_ltp.iloc[-1])
+            paper_engine = getattr(self, "paper_engine", None)
+            rsmb_strategy = getattr(self, "rsmb_strategy", None)
+            if paper_engine is not None:
+                paper_engine.on_price_update(symbol, latest_price)
+            if rsmb_strategy is not None:
+                rsmb_strategy.on_price_update(symbol, latest_price)
 
         for tf in self.timeframes:
             agg_dict = {"ltp": ["first", "max", "min", "last"], "volume": "sum"}
@@ -116,7 +211,13 @@ class CandleBuilder:
             new_last_ts = updated_df.index[-1] if not updated_df.empty else None
             self.candles[symbol][tf] = updated_df
 
-            if tf == "5min" and old_last_ts is not None and new_last_ts is not None and new_last_ts > old_last_ts:
+            if (
+                tf == "5min"
+                and old_last_ts is not None
+                and new_last_ts is not None
+                and new_last_ts > old_last_ts
+                and self._is_live_session_close(symbol, old_last_ts, new_last_ts)
+            ):
                 closed_candle_ts = old_last_ts
                 closed_5m = self.candles[symbol][tf].loc[:closed_candle_ts].copy()
                 closed_15m = self.candles[symbol]["15min"].loc[:closed_candle_ts].copy()
@@ -131,9 +232,31 @@ class CandleBuilder:
                     await self.order_manager.execute_signal(signal)
 
             # --- RSMB 15m candle hook (independent of existing strategies) ---
-            if tf == "15min" and old_last_ts is not None and new_last_ts is not None and new_last_ts > old_last_ts:
+            if (
+                tf == "15min"
+                and old_last_ts is not None
+                and new_last_ts is not None
+                and new_last_ts > old_last_ts
+                and self._is_live_session_close(symbol, old_last_ts, new_last_ts)
+            ):
                 if self.rsmb_strategy is not None:
                     closed_15m = self.candles[symbol]["15min"].loc[:old_last_ts].copy()
+                    
+                    # Calculate features required by XGBoost AI filter
+                    from features.price_features import PriceFeatures
+                    try:
+                        from ta.trend import MACD
+                        macd = MACD(close=closed_15m['close'], window_slow=26, window_fast=12, window_sign=9)
+                        closed_15m['macd_hist'] = macd.macd_diff()
+                    except Exception:
+                        pass
+                    closed_15m = PriceFeatures.add_indicators(closed_15m)
+                    
+                    # Compute and push daily closes for RS_Rank calculation (lookback=20 days)
+                    if not closed_15m.empty:
+                        daily_closes = closed_15m['close'].resample("D").last().dropna()
+                        self.rsmb_strategy.push_daily(symbol, daily_closes)
+                    
                     self.rsmb_strategy.push_bar(symbol, closed_15m)
                     self.rsmb_strategy.update_trailing_stops(symbol)
                     bar = closed_15m.iloc[-1] if not closed_15m.empty else None
@@ -145,6 +268,8 @@ class CandleBuilder:
                             order_id = self.paper_engine.simulate_fill(rsmb_signal, next_open)
                             self.rsmb_strategy.on_fill(rsmb_signal, next_open)
                             logger.success(f"RSMB order {order_id}: {rsmb_signal.side} {symbol} filled @ {next_open:.2f}")
+
+        self._write_candle_snapshot()
 
     async def run(self):
         """Consume ticks and build candles."""

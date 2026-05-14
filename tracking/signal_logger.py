@@ -26,16 +26,46 @@ class SignalLogger:
             dir_part = os.path.dirname(self.filepath)
             if dir_part:
                 os.makedirs(dir_part, exist_ok=True)
-            with open(self.filepath, 'w', newline='') as f:
+            with open(self.filepath, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 writer.writerow(self.headers)
 
-    def log_signal(self, symbol: str, side: str, strategy: str, entry: float, sl: float, target: float, 
-                   score: float, status: str, reason: str = ""):
+    def log_signal(
+        self,
+        symbol: str,
+        side: str,
+        strategy: str | float = "unknown",
+        entry: float | None = None,
+        sl: float | None = None,
+        target: float | None = None,
+        score: float | str | None = None,
+        status: str | None = None,
+        reason: str = "",
+    ):
         """
         status: 'TRADE' or 'NO_TRADE'
+
+        Backward compatible positional forms:
+        - log_signal(symbol, side, strategy, entry, sl, target, score, status, reason="")
+        - log_signal(symbol, side, entry, sl, target, score, status)
         """
         try:
+            if status is None and isinstance(score, str):
+                status = score
+                score = target
+                target = sl
+                sl = entry
+                entry = strategy
+                strategy = "unknown"
+
+            if status is None:
+                raise ValueError("Signal status is required")
+
+            entry = float(entry or 0)
+            sl = float(sl or 0)
+            target = float(target or 0)
+            score = float(score or 0)
+
             dedupe_window = 240 if status == "TRADE" else 60
             dedupe_key = (symbol, side, status, reason)
             now = time.time()
@@ -60,7 +90,7 @@ class SignalLogger:
             
             for attempt in range(3):
                 try:
-                    with open(self.filepath, 'a', newline='') as f:
+                    with open(self.filepath, 'a', newline='', encoding='utf-8') as f:
                         writer = csv.DictWriter(f, fieldnames=self.headers)
                         writer.writerow(row)
                     break

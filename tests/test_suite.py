@@ -443,6 +443,31 @@ class TestRetrainPipeline(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Adaptive Learning Tests
+# ---------------------------------------------------------------------------
+
+class TestAdaptiveLearningEngine(unittest.TestCase):
+
+    def test_existing_currency_quant_key_does_not_crash(self):
+        from learning.adaptive_learning_engine import AdaptiveLearningEngine
+
+        with tempfile.TemporaryDirectory() as tmp:
+            params_path = Path(tmp) / "adaptive_params.json"
+            params_path.write_text(
+                json.dumps({
+                    "equity_min_buy_confidence": 0.72,
+                    "equity_min_sell_confidence": 0.70,
+                    "currency_min_quant_score": 70,
+                }),
+                encoding="utf-8",
+            )
+            engine = AdaptiveLearningEngine(str(params_path))
+            engine.tune_parameters({"win_rate": "40.0%", "total_trades": 20})
+            params = json.loads(params_path.read_text(encoding="utf-8"))
+            self.assertEqual(params["currency_min_quant_score"], 72)
+
+
+# ---------------------------------------------------------------------------
 # Signal Logger / Dashboard Tests
 # ---------------------------------------------------------------------------
 
@@ -492,6 +517,34 @@ class TestSignalLogger(unittest.TestCase):
         self.assertIsNone(err)
         self.assertTrue(df.empty)
 
+    def test_dashboard_loader_repairs_old_trade_journal_strategy_column(self):
+        from dashboard.data_loader import load_csv_safely
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trade_journal.csv"
+            path.write_text(
+                "date,symbol,side,entry_price,exit_price,qty,pnl_inr,pnl_after_costs,outcome,confidence\n"
+                "2026-05-14 11:30:43,ICICIBANK,SELL,rsmb,1239.0,1246.4,80,-636.0,-636.0,SL_HIT,0.7662\n",
+                encoding="utf-8",
+            )
+            df, err = load_csv_safely(str(path))
+
+        self.assertIsNone(err)
+        self.assertEqual(df.iloc[0]["symbol"], "ICICIBANK")
+        self.assertEqual(df.iloc[0]["strategy"], "rsmb")
+        self.assertEqual(float(df.iloc[0]["entry_price"]), 1239.0)
+        self.assertEqual(df.iloc[0]["outcome"], "SL_HIT")
+
+    def test_dashboard_metrics_include_win_rate_for_empty_and_non_empty_data(self):
+        from dashboard.data_loader import calculate_advanced_metrics
+
+        empty_metrics = calculate_advanced_metrics(pd.DataFrame())
+        self.assertIn("win_rate", empty_metrics)
+        self.assertEqual(empty_metrics["win_rate"], 0.0)
+
+        metrics = calculate_advanced_metrics(pd.DataFrame({"pnl_after_costs": [100.0, -50.0]}))
+        self.assertEqual(metrics["win_rate"], 50.0)
+
     def test_filepath_without_directory_does_not_crash(self):
         """L3: SignalLogger must not crash when filepath has no directory component."""
         original_cwd = os.getcwd()
@@ -537,6 +590,105 @@ class TestRiskManagerAgent(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# RSMB Position Lifecycle Tests
+# ---------------------------------------------------------------------------
+
+class TestRSMBPositionManager(unittest.TestCase):
+
+    def test_price_updates_are_symbol_scoped(self):
+        from strategies.base_strategy import Signal
+        from strategies.rsmb.position_manager import RSMBPositionManager
+
+        manager = RSMBPositionManager(cost_per_order_inr=0)
+        signal = Signal(
+            strategy="rsmb",
+            symbol="HDFCBANK",
+            side="BUY",
+            entry=100,
+            sl=95,
+            target1=105,
+            target2=110,
+            qty=10,
+            score=0.8,
+            rs_rank=1.1,
+            rejection_reason=None,
+            timestamp=pd.Timestamp("2026-05-14 09:30", tz="Asia/Kolkata"),
+        )
+        pos_id = manager.open_position(signal)
+        manager.on_fill(pos_id, 100, pd.Timestamp("2026-05-14 09:31", tz="Asia/Kolkata"))
+
+        self.assertEqual(manager.on_price_update(94, symbol="RELIANCE"), [])
+        self.assertEqual(manager.on_price_update(94, symbol="HDFCBANK")[0][1], "SL_HIT")
+
+
+class TestPaperEngineActiveSnapshot(unittest.TestCase):
+
+    def test_active_snapshot_written_for_dashboard(self):
+        from execution.paper_engine import PaperEngine
+        from strategies.base_strategy import Signal
+
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot_path = Path(tmp) / "paper_orders.json"
+            journal_path = Path(tmp) / "trade_journal.csv"
+            engine = PaperEngine(
+                journal_path=str(journal_path),
+                active_orders_path=str(snapshot_path),
+            )
+            signal = Signal(
+                strategy="rsmb",
+                symbol="WIPRO",
+                side="SELL",
+                entry=187,
+                sl=188,
+                target1=185,
+                target2=183,
+                qty=10,
+                score=0.76,
+                rs_rank=0.9,
+                rejection_reason=None,
+                timestamp=pd.Timestamp("2026-05-14 11:15", tz="Asia/Kolkata"),
+            )
+            order_id = engine.simulate_fill(signal, 187.2)
+            rows = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            self.assertEqual(rows[0]["order_id"], order_id)
+            self.assertEqual(rows[0]["symbol"], "WIPRO")
+            self.assertEqual(rows[0]["source"], "paper_engine")
+
+    def test_paper_engine_journal_separates_gross_and_net_pnl(self):
+        from execution.paper_engine import PaperEngine
+        from strategies.base_strategy import Signal
+
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot_path = Path(tmp) / "paper_orders.json"
+            journal_path = Path(tmp) / "trade_journal.csv"
+            engine = PaperEngine(
+                cost_per_order_inr=22,
+                journal_path=str(journal_path),
+                active_orders_path=str(snapshot_path),
+            )
+            signal = Signal(
+                strategy="rsmb",
+                symbol="ICICIBANK",
+                side="SELL",
+                entry=1239.0,
+                sl=1246.4,
+                target1=1229.8,
+                target2=1220.0,
+                qty=80,
+                score=0.7662,
+                rs_rank=0.9,
+                rejection_reason=None,
+                timestamp=pd.Timestamp("2026-05-14 11:15", tz="Asia/Kolkata"),
+            )
+            engine.simulate_fill(signal, 1239.0)
+            engine.on_price_update("ICICIBANK", 1246.4)
+
+            df = pd.read_csv(journal_path)
+            self.assertEqual(float(df.iloc[-1]["pnl_inr"]), -592.0)
+            self.assertEqual(float(df.iloc[-1]["pnl_after_costs"]), -636.0)
+
+
+# ---------------------------------------------------------------------------
 # Candle Builder Tests (C6, H9)
 # ---------------------------------------------------------------------------
 
@@ -546,31 +698,163 @@ class TestCandleBuilder(unittest.TestCase):
         """C6: out-of-order ticks must be sorted before aggregation."""
         from pipeline.candle_builder import CandleBuilder
 
+        with tempfile.TemporaryDirectory() as tmp:
+            cb = CandleBuilder.__new__(CandleBuilder)
+            cb.config = {"instruments": {"equity": ["NIFTY"], "currency": []}}
+            cb.symbols = ["NIFTY"]
+            cb.timeframes = ["5min"]
+            cb.redis_queue = None
+            cb.equity_engine = None
+            cb.currency_engine = None
+            cb.order_manager = None
+            cb.rsmb_strategy = None
+            cb.paper_engine = None
+            cb.candle_snapshot_path = str(Path(tmp) / "candle_snapshot.json")
+            cb.tick_data = {"NIFTY": []}
+            cb.candles = {"NIFTY": {"5min": pd.DataFrame()}}
+
+            # Create ticks out of order
+            ticks = [
+                {"data": {"timestamp": "2026-05-13 09:20:00", "ltp": 101.0, "volume": 100}},
+                {"data": {"timestamp": "2026-05-13 09:15:00", "ltp": 100.0, "volume": 200}},  # earlier
+            ]
+
+            async def run():
+                await cb._process_ticks_to_candles("NIFTY", ticks)
+                df = cb.candles["NIFTY"]["5min"]
+                if not df.empty and len(df) >= 1:
+                    # First candle should start at 09:15, not 09:20
+                    self.assertLessEqual(df.index[0].strftime("%H:%M"), "09:15")
+
+            asyncio.run(run())
+
+    def test_15min_candle_snapshot_written_for_dashboard(self):
+        from pipeline.candle_builder import CandleBuilder
+
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot_path = Path(tmp) / "candle_snapshot.json"
+            cb = CandleBuilder.__new__(CandleBuilder)
+            cb.config = {"instruments": {"equity": ["NIFTY"], "currency": []}}
+            cb.symbols = ["NIFTY"]
+            cb.timeframes = ["15min"]
+            cb.redis_queue = None
+            cb.equity_engine = None
+            cb.currency_engine = None
+            cb.order_manager = None
+            cb.rsmb_strategy = None
+            cb.paper_engine = None
+            cb.candle_snapshot_path = str(snapshot_path)
+            cb.tick_data = {"NIFTY": []}
+            cb.candles = {"NIFTY": {"15min": pd.DataFrame()}}
+
+            ticks = [
+                {"data": {"timestamp": "2026-05-14 09:15:01", "ltp": 100.0, "volume": 10}},
+                {"data": {"timestamp": "2026-05-14 09:20:00", "ltp": 102.0, "volume": 15}},
+                {"data": {"timestamp": "2026-05-14 09:29:59", "ltp": 101.0, "volume": 20}},
+            ]
+
+            async def run():
+                await cb._process_ticks_to_candles("NIFTY", ticks)
+
+            asyncio.run(run())
+            snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            candle = snapshot["symbols"]["NIFTY"]["15min"][-1]
+            self.assertEqual(candle["open"], 100.0)
+            self.assertEqual(candle["high"], 102.0)
+            self.assertEqual(candle["low"], 100.0)
+            self.assertEqual(candle["close"], 101.0)
+
+    def test_stale_historical_candle_does_not_trigger_engine(self):
+        """Historical preload from a prior session must not fire strategies on restart."""
+        from pipeline.candle_builder import CandleBuilder
+
+        class FakeEquityEngine:
+            def __init__(self):
+                self.calls = 0
+
+            async def process_symbol(self, symbol, candles):
+                self.calls += 1
+                return None
+
+        idx_5m = pd.DatetimeIndex([pd.Timestamp("2026-05-13 15:25", tz="Asia/Kolkata")])
+        idx_15m = pd.DatetimeIndex([pd.Timestamp("2026-05-13 15:15", tz="Asia/Kolkata")])
+        old_5m = pd.DataFrame(
+            {"open": [100], "high": [101], "low": [99], "close": [100], "volume": [1000], "oi": [0]},
+            index=idx_5m,
+        )
+        old_15m = pd.DataFrame(
+            {"open": [100], "high": [101], "low": [99], "close": [100], "volume": [1000], "oi": [0]},
+            index=idx_15m,
+        )
+
+        engine = FakeEquityEngine()
         cb = CandleBuilder.__new__(CandleBuilder)
         cb.config = {"instruments": {"equity": ["NIFTY"], "currency": []}}
         cb.symbols = ["NIFTY"]
-        cb.timeframes = ["5min"]
+        cb.timeframes = ["5min", "15min"]
         cb.redis_queue = None
-        cb.equity_engine = None
+        cb.equity_engine = engine
         cb.currency_engine = None
         cb.order_manager = None
+        cb.rsmb_strategy = None
+        cb.paper_engine = None
+        cb.candle_snapshot_path = str(Path(tempfile.gettempdir()) / "stale_candle_snapshot_test.json")
         cb.tick_data = {"NIFTY": []}
-        cb.candles = {"NIFTY": {"5min": pd.DataFrame()}}
+        cb.candles = {"NIFTY": {"5min": old_5m, "15min": old_15m}}
 
-        # Create ticks out of order
-        ticks = [
-            {"data": {"timestamp": "2026-05-13 09:20:00", "ltp": 101.0, "volume": 100}},
-            {"data": {"timestamp": "2026-05-13 09:15:00", "ltp": 100.0, "volume": 200}},  # earlier
-        ]
+        ticks = [{"data": {"timestamp": "2026-05-14 09:15:01", "ltp": 101.0, "volume": 100}}]
 
         async def run():
             await cb._process_ticks_to_candles("NIFTY", ticks)
-            df = cb.candles["NIFTY"]["5min"]
-            if not df.empty and len(df) >= 1:
-                # First candle should start at 09:15, not 09:20
-                self.assertLessEqual(df.index[0].strftime("%H:%M"), "09:15")
 
         asyncio.run(run())
+        self.assertEqual(engine.calls, 0)
+
+    def test_same_session_candle_close_triggers_engine(self):
+        """Normal live candle closes must still trigger strategy evaluation."""
+        from pipeline.candle_builder import CandleBuilder
+
+        class FakeEquityEngine:
+            def __init__(self):
+                self.calls = 0
+
+            async def process_symbol(self, symbol, candles):
+                self.calls += 1
+                return None
+
+        idx_5m = pd.DatetimeIndex([pd.Timestamp("2026-05-14 09:15", tz="Asia/Kolkata")])
+        idx_15m = pd.DatetimeIndex([pd.Timestamp("2026-05-14 09:15", tz="Asia/Kolkata")])
+        old_5m = pd.DataFrame(
+            {"open": [100], "high": [101], "low": [99], "close": [100], "volume": [1000], "oi": [0]},
+            index=idx_5m,
+        )
+        old_15m = pd.DataFrame(
+            {"open": [100], "high": [101], "low": [99], "close": [100], "volume": [1000], "oi": [0]},
+            index=idx_15m,
+        )
+
+        engine = FakeEquityEngine()
+        cb = CandleBuilder.__new__(CandleBuilder)
+        cb.config = {"instruments": {"equity": ["NIFTY"], "currency": []}}
+        cb.symbols = ["NIFTY"]
+        cb.timeframes = ["5min", "15min"]
+        cb.redis_queue = None
+        cb.equity_engine = engine
+        cb.currency_engine = None
+        cb.order_manager = None
+        cb.rsmb_strategy = None
+        cb.paper_engine = None
+        cb.candle_snapshot_path = str(Path(tempfile.gettempdir()) / "same_session_candle_snapshot_test.json")
+        cb.tick_data = {"NIFTY": []}
+        cb.candles = {"NIFTY": {"5min": old_5m, "15min": old_15m}}
+
+        ticks = [{"data": {"timestamp": "2026-05-14 09:20:01", "ltp": 101.0, "volume": 100}}]
+
+        async def run():
+            await cb._process_ticks_to_candles("NIFTY", ticks)
+
+        asyncio.run(run())
+        self.assertEqual(engine.calls, 1)
 
 
 if __name__ == "__main__":

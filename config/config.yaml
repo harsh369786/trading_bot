@@ -19,7 +19,7 @@ capital:
   max_open_trades_currency: 2
 
 instruments:
-  equity: ["NIFTY", "BANKNIFTY", "RELIANCE", "HDFCBANK"]
+  equity: ["NIFTY", "BANKNIFTY", "RELIANCE", "HDFCBANK", "INFY", "TCS", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK", "LT", "WIPRO", "BAJFINANCE", "TMPV", "TATASTEEL", "ADANIPORTS"]
   currency: ["USDINR", "EURINR"]
   correlated_pairs:                 # skip second signal if abs(corr) > threshold
     - ["NIFTY", "BANKNIFTY"]

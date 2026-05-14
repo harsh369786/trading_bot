@@ -132,7 +132,7 @@ class RSMBPositionManager:
     # ------------------------------------------------------------------
 
     def on_price_update(
-        self, price: float
+        self, price: float, symbol: Optional[str] = None
     ) -> List[Tuple[str, str, float]]:
         """
         Check all open positions against the current price.
@@ -146,6 +146,8 @@ class RSMBPositionManager:
             positions_snapshot = list(self._positions.items())
 
         for pos_id, pos in positions_snapshot:
+            if symbol is not None and pos.signal.symbol != symbol:
+                continue
             if pos.status not in ("ACTIVE", "PARTIAL"):
                 continue
 

@@ -18,6 +18,13 @@ class AngelOneMaster:
         "NSE": "NSE",
         "NFO": "NFO",
     }
+    SYMBOL_ALIASES = {
+        # Tata Motors changed symbol after the 2025 demerger/name change.
+        # The old TATAMOTORS equity no longer exists in Angel One's master.
+        "TATAMOTORS": "TMPV",
+        "TATAMOTORS_PV": "TMPV",
+        "TATAMOTORS_CV": "TMCV",
+    }
 
     @classmethod
     def update_contract(cls):
@@ -63,7 +70,10 @@ class AngelOneMaster:
             
             df = pd.read_json(cls.CACHE_FILE)
             exchange = cls.EXCHANGE_ALIASES.get(str(exchange).upper(), str(exchange).upper())
-            symbol = str(symbol).upper()
+            requested_symbol = str(symbol).upper()
+            symbol = cls.SYMBOL_ALIASES.get(requested_symbol, requested_symbol)
+            if symbol != requested_symbol:
+                logger.info(f"Using Angel One symbol alias {requested_symbol} -> {symbol}")
             df['exch_seg'] = df['exch_seg'].astype(str).str.upper()
             df['name'] = df['name'].astype(str).str.upper()
             df['symbol'] = df['symbol'].astype(str).str.upper()

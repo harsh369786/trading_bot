@@ -226,14 +226,43 @@ class OrderManager:
     def _ensure_journal_header(self):
         """Write CSV header exactly once when the file doesn't yet exist (C5 fix)."""
         import csv
+        fieldnames = [
+            "date", "symbol", "side", "strategy", "entry_price", "exit_price",
+            "qty", "pnl_inr", "pnl_after_costs", "outcome", "confidence",
+        ]
         os.makedirs(os.path.dirname(self._journal_path) or ".", exist_ok=True)
         if not os.path.exists(self._journal_path) or os.path.getsize(self._journal_path) == 0:
             with open(self._journal_path, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=[
-                    "date", "symbol", "side", "entry_price", "exit_price",
-                    "qty", "pnl_inr", "pnl_after_costs", "outcome", "confidence",
-                ])
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
+            return
+
+        try:
+            with open(self._journal_path, newline="") as f:
+                rows = list(csv.reader(f))
+            old_fieldnames = [
+                "date", "symbol", "side", "entry_price", "exit_price",
+                "qty", "pnl_inr", "pnl_after_costs", "outcome", "confidence",
+            ]
+            if not rows or rows[0] == fieldnames or rows[0] != old_fieldnames:
+                return
+
+            repaired = [fieldnames]
+            for row in rows[1:]:
+                if not row:
+                    continue
+                if len(row) == len(old_fieldnames):
+                    repaired.append(row[:3] + ["Unknown"] + row[3:])
+                elif len(row) == len(fieldnames):
+                    repaired.append(row)
+
+            tmp_path = f"{self._journal_path}.tmp"
+            with open(tmp_path, "w", newline="") as f:
+                csv.writer(f).writerows(repaired)
+            os.replace(tmp_path, self._journal_path)
+            logger.warning("Repaired trade journal header to include strategy column.")
+        except Exception as exc:
+            logger.warning(f"Trade journal schema check failed: {exc}")
 
     async def _place_protection_orders(self, parent_id: str, signal: dict):
         """Place SL-M and target limit orders. H3: results are now checked."""

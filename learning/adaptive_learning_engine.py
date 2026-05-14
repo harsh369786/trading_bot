@@ -23,18 +23,21 @@ class AdaptiveLearningEngine:
         if not stats: return
         
         # Load current params
-        params = self.default_params
+        params = self.default_params.copy()
         if os.path.exists(self.params_path):
             with open(self.params_path, 'r') as f:
-                params = json.load(f)
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    params.update(loaded)
         
         reason = "Performance stable"
         win_rate = float(stats.get("win_rate", "0%").replace("%", ""))
         
         # Logic: If win rate < 50%, tighten quality threshold
         if win_rate < 50 and stats.get("total_trades", 0) >= 15:
-            params["min_quant_score"] = min(params["min_quant_score"] + 2, 85)
-            params["min_adx"] = min(params["min_adx"] + 2, 30)
+            quant_key = "currency_min_quant_score" if "currency_min_quant_score" in params else "min_quant_score"
+            params[quant_key] = min(float(params.get(quant_key, 70)) + 2, 85)
+            params["min_adx"] = min(float(params.get("min_adx", 20)) + 2, 30)
             reason = f"Win rate low ({win_rate}%). Tightened thresholds."
             
         # Save updated params

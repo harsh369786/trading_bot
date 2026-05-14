@@ -25,7 +25,7 @@ class TradeJournalWriter:
         """Initialize the CSV file with headers if it doesn't exist."""
         if not os.path.exists(self.filepath):
             os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
-            with open(self.filepath, 'w', newline='') as f:
+            with open(self.filepath, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 writer.writerow(self.headers)
             logger.info(f"Initialized Trade Journal at {self.filepath}")
@@ -39,7 +39,7 @@ class TradeJournalWriter:
             # Fill missing keys with None to avoid DictWriter errors
             row = {header: trade_data.get(header, None) for header in self.headers}
             
-            with open(self.filepath, 'a', newline='') as f:
+            with open(self.filepath, 'a', newline='', encoding='utf-8') as f:
                 writer = csv.DictWriter(f, fieldnames=self.headers)
                 writer.writerow(row)
             logger.info(f"📓 Journal Entry: {trade_data['symbol']} | PnL: ₹{trade_data['pnl_inr']}")

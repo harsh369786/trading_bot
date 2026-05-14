@@ -15,6 +15,7 @@ Spec compliance:
 from __future__ import annotations
 
 import csv
+import json
 import os
 import threading
 import time
@@ -49,6 +50,7 @@ class Order:
     fill_price: float = 0.0
     status: str = "PENDING"   # PENDING → ACTIVE → PARTIAL → CLOSED
     pnl_unrealised: float = 0.0
+    pnl_gross_realised: float = 0.0
     pnl_realised: float = 0.0
     score: float = 0.0
     rs_rank: Optional[float] = None
@@ -78,12 +80,15 @@ class PaperEngine:
         self,
         cost_per_order_inr: float = 22.0,
         journal_path: str = "data/trade_journal.csv",
+        active_orders_path: str = "data/paper_orders.json",
     ) -> None:
         self._orders: Dict[str, Order] = {}
         self._lock = threading.Lock()
         self._cost_per_order = cost_per_order_inr
         self._journal_path = journal_path
+        self._active_orders_path = active_orders_path
         self._ensure_journal_header()
+        self._write_active_snapshot()
 
     # ------------------------------------------------------------------
     # Order intake
@@ -126,6 +131,7 @@ class PaperEngine:
         with self._lock:
             self._orders[order_id] = order
 
+        self._write_active_snapshot()
         logger.info(
             f"PaperEngine: [{signal.strategy}] {signal.side} {signal.symbol} "
             f"filled @ {next_bar_open:.2f} | id={order_id}"
@@ -207,6 +213,7 @@ class PaperEngine:
             gross = self._calc_gross(order.side, order.fill_price, exit_price, t1_qty)
             net = gross - (self._cost_per_order * 2)
 
+            order.pnl_gross_realised += gross
             order.pnl_realised += net
             order.qty_open -= t1_qty
             order.qty_t1_booked = t1_qty
@@ -220,6 +227,8 @@ class PaperEngine:
             f"booked {t1_qty} shares, SL → BE={order.fill_price:.2f}"
         )
 
+        self._write_active_snapshot()
+
     def _close_position(self, order_id: str, exit_price: float, outcome: str) -> None:
         """Close remaining qty, compute final P&L, write to journal."""
         with self._lock:
@@ -229,6 +238,7 @@ class PaperEngine:
 
             gross = self._calc_gross(order.side, order.fill_price, exit_price, order.qty_open)
             net = gross - (self._cost_per_order * 2)
+            order.pnl_gross_realised += gross
             order.pnl_realised += net
             order.qty_open = 0
             order.pnl_unrealised = 0.0
@@ -240,6 +250,7 @@ class PaperEngine:
             journal_row = self._build_journal_row(order, exit_price)
 
         self._write_to_journal(journal_row)
+        self._write_active_snapshot()
         logger.info(
             f"PaperEngine: {order_id} {outcome} @ {exit_price:.2f} "
             f"net_pnl={order.pnl_realised:.2f}"
@@ -338,16 +349,88 @@ class PaperEngine:
             orders = [o for o in orders if o.strategy == strategy]
         return orders[:limit]
 
+    def _active_snapshot_rows(self) -> List[dict]:
+        with self._lock:
+            active = [
+                o for o in self._orders.values()
+                if o.status in ("ACTIVE", "PARTIAL")
+            ]
+            return [
+                {
+                    "order_id": o.order_id,
+                    "symbol": o.symbol,
+                    "side": o.side,
+                    "strategy": o.strategy,
+                    "entry": round(o.fill_price or o.entry, 4),
+                    "sl": round(o.sl, 4),
+                    "target": round(o.target1, 4),
+                    "target1": round(o.target1, 4),
+                    "target2": round(o.target2, 4),
+                    "qty": o.qty,
+                    "qty_open": o.qty_open,
+                    "status": o.status,
+                    "pnl_unrealised": round(o.pnl_unrealised, 2),
+                    "pnl_realised": round(o.pnl_realised, 2),
+                    "confidence": round(o.score, 4),
+                    "source": "paper_engine",
+                    "entry_time": o.entry_time,
+                }
+                for o in active
+            ]
+
+    def _write_active_snapshot(self) -> None:
+        os.makedirs(os.path.dirname(self._active_orders_path) or ".", exist_ok=True)
+        rows = self._active_snapshot_rows()
+        tmp_path = f"{self._active_orders_path}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(rows, f, indent=2)
+            os.replace(tmp_path, self._active_orders_path)
+        except Exception as exc:
+            logger.warning(f"PaperEngine: active order snapshot write failed: {exc}")
+
     # ------------------------------------------------------------------
     # Journal
     # ------------------------------------------------------------------
 
     def _ensure_journal_header(self) -> None:
         os.makedirs(os.path.dirname(self._journal_path) or ".", exist_ok=True)
+        fields = self._journal_fields()
         if not os.path.exists(self._journal_path) or os.path.getsize(self._journal_path) == 0:
             with open(self._journal_path, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=self._journal_fields())
+                writer = csv.DictWriter(f, fieldnames=fields)
                 writer.writeheader()
+            return
+
+        try:
+            with open(self._journal_path, newline="") as f:
+                rows = list(csv.reader(f))
+            if not rows or rows[0] == fields:
+                return
+
+            old_fields = [
+                "date", "symbol", "side", "entry_price", "exit_price",
+                "qty", "pnl_inr", "pnl_after_costs", "outcome", "confidence",
+            ]
+            if rows[0] != old_fields:
+                return
+
+            repaired = [fields]
+            for row in rows[1:]:
+                if not row:
+                    continue
+                if len(row) == len(old_fields):
+                    repaired.append(row[:3] + ["Unknown"] + row[3:])
+                elif len(row) == len(fields):
+                    repaired.append(row)
+
+            tmp_path = f"{self._journal_path}.tmp"
+            with open(tmp_path, "w", newline="") as f:
+                csv.writer(f).writerows(repaired)
+            os.replace(tmp_path, self._journal_path)
+            logger.warning("PaperEngine: repaired trade journal header to include strategy column.")
+        except Exception as exc:
+            logger.warning(f"PaperEngine: trade journal schema check failed: {exc}")
 
     @staticmethod
     def _journal_fields() -> list:
@@ -367,7 +450,7 @@ class PaperEngine:
             "entry_price": round(order.fill_price, 4),
             "exit_price": round(exit_price, 4),
             "qty": order.qty,
-            "pnl_inr": round(order.pnl_realised, 2),
+            "pnl_inr": round(order.pnl_gross_realised, 2),
             "pnl_after_costs": round(order.pnl_realised, 2),  # costs already deducted
             "outcome": order.outcome,
             "confidence": round(order.score, 4),

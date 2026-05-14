@@ -16,6 +16,8 @@ except ModuleNotFoundError:
 
 SIGNAL_PATH = "data/signal_log.csv"
 TRADE_PATH = "data/trade_journal.csv"
+PAPER_ORDER_PATH = "data/paper_orders.json"
+CANDLE_PATH = "data/candle_snapshot.json"
 ACTIVE_ORDER_KEY = "bot:execution:active_orders"
 
 # ── Page config ──────────────────────────────────────────────────────────────
@@ -187,6 +189,7 @@ def get_csv(file_path: str):
 
 @st.cache_data(ttl=2)
 def get_active_orders():
+    rows = []
     try:
         import redis
         url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
@@ -194,13 +197,37 @@ def get_active_orders():
                                        socket_connect_timeout=1, socket_timeout=1)
         raw = client.get(ACTIVE_ORDER_KEY)
         client.close()
-        if not raw:
-            return pd.DataFrame(), None
-        data = json.loads(raw)
-        rows = [dict(order) | {"order_id": oid} for oid, order in data.items()]
-        return pd.DataFrame(rows), None
+        if raw:
+            data = json.loads(raw)
+            rows.extend(
+                dict(order) | {"order_id": oid, "source": "order_manager"}
+                for oid, order in data.items()
+            )
     except Exception as exc:
         return pd.DataFrame(), str(exc)
+
+    try:
+        if os.path.exists(PAPER_ORDER_PATH):
+            with open(PAPER_ORDER_PATH, "r", encoding="utf-8") as f:
+                paper_rows = json.load(f)
+            if isinstance(paper_rows, list):
+                rows.extend(row for row in paper_rows if isinstance(row, dict))
+    except Exception as exc:
+        return pd.DataFrame(), str(exc)
+
+    return pd.DataFrame(rows), None
+
+
+@st.cache_data(ttl=2)
+def get_candle_snapshot():
+    if not os.path.exists(CANDLE_PATH):
+        return {}, None
+    try:
+        with open(CANDLE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}, None
+    except Exception as exc:
+        return {}, str(exc)
 
 
 def normalize_signals(df: pd.DataFrame) -> pd.DataFrame:
@@ -250,6 +277,7 @@ df_signals_raw = normalize_signals(df_signals_raw)
 df_signals = dedupe_signals(df_signals_raw)
 df_trades = normalize_trades(df_trades_raw)
 df_active_orders, redis_err = get_active_orders()
+candle_snapshot, candle_err = get_candle_snapshot()
 
 today = datetime.now().date()
 signals_today = (
@@ -332,6 +360,8 @@ if trade_err:
     st.warning(f"Trade journal: {trade_err}")
 if redis_err:
     st.warning(f"Redis: {redis_err}")
+if candle_err:
+    st.warning(f"Candle snapshot: {candle_err}")
 
 # ── Top KPI strip ─────────────────────────────────────────────────────────────
 k1, k2, k3, k4, k5, k6 = st.columns(6)
@@ -630,15 +660,32 @@ with tabs[1]:
 
 # ─── TAB 2: ORDERS ────────────────────────────────────────────────────────────
 with tabs[2]:
+    st.subheader("Order Lifecycle")
+    oc1, oc2, oc3, oc4 = st.columns(4)
+    oc1.metric("Open Paper Orders", len(df_active_orders))
+    oc2.metric("Closed Paper Orders", len(trades_view))
+    oc3.metric(
+        "Closed Winners",
+        len(trades_view[trades_view[pnl_col] > 0])
+        if not trades_view.empty and pnl_col in trades_view.columns
+        else 0,
+    )
+    oc4.metric(
+        "Closed Losers",
+        len(trades_view[trades_view[pnl_col] < 0])
+        if not trades_view.empty and pnl_col in trades_view.columns
+        else 0,
+    )
+
     c1, c2 = st.columns(2)
 
     with c1:
-        st.subheader("Active Paper Orders")
+        st.subheader("Open Paper Orders")
         if df_active_orders.empty:
-            st.info("No active orders in Redis.")
+            st.info("No open paper orders right now. Closed orders are shown below.")
         else:
             cols = [c for c in ["order_id", "symbol", "side", "entry", "sl", "target",
-                                  "qty", "status", "domain"] if c in df_active_orders.columns]
+                                  "qty", "qty_open", "status", "strategy", "source"] if c in df_active_orders.columns]
             st.dataframe(df_active_orders[cols], hide_index=True, use_container_width=True)
 
     with c2:
@@ -665,16 +712,18 @@ with tabs[2]:
             st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
-    st.subheader("Closed Trades Details")
+    st.subheader("Closed Paper Orders")
     if trades_view.empty:
-        st.info("No closed trades yet.")
+        st.info("No closed paper orders yet.")
     else:
         _date_col = "date" if "date" in trades_view.columns else "timestamp"
-        display_cols = [c for c in ["date", "symbol", "side", "entry_price", "exit_price",
+        closed = trades_view.sort_values(_date_col, ascending=False).copy()
+        closed["status"] = closed["outcome"] if "outcome" in closed.columns else "CLOSED"
+        display_cols = [c for c in ["date", "symbol", "side", "strategy", "entry_price", "exit_price",
                                      "qty", "pnl_inr", "pnl_after_costs", "outcome", "confidence"]
-                        if c in trades_view.columns]
+                        if c in closed.columns]
         st.dataframe(
-            trades_view.sort_values(_date_col, ascending=False)[display_cols],
+            closed[display_cols],
             hide_index=True, use_container_width=True,
         )
 
@@ -756,6 +805,7 @@ with tabs[4]:
         {"Check": "Signal CSV", "Status": "OK" if os.path.exists(SIGNAL_PATH) else "Missing", "Detail": SIGNAL_PATH},
         {"Check": "Trade Journal", "Status": "OK" if os.path.exists(TRADE_PATH) else "Missing", "Detail": TRADE_PATH},
         {"Check": "Redis", "Status": "OK" if not redis_err else "Warning", "Detail": redis_err or f"{len(df_active_orders)} orders"},
+        {"Check": "Candle Snapshot", "Status": "OK" if candle_snapshot else "Missing", "Detail": CANDLE_PATH},
         {"Check": "Duplicate Signals", "Status": "Info", "Detail": f"{max(raw_count - len(df_signals), 0)} collapsed (5-min buckets)"},
         {"Check": "Ticks DB", "Status": "OK" if os.path.exists("data/ticks.db") else "Missing", "Detail": "data/ticks.db"},
     ]
@@ -808,6 +858,30 @@ with tabs[4]:
         hist_rows.append({"Symbol": sym, "File": path, "Present": os.path.exists(path)})
     st.dataframe(pd.DataFrame(hist_rows), hide_index=True, use_container_width=True)
 
+    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+    st.subheader("Latest 15-Minute Candles")
+    symbols_data = candle_snapshot.get("symbols", {}) if candle_snapshot else {}
+    rows = []
+    for symbol, by_tf in symbols_data.items():
+        candles_15m = by_tf.get("15min") or []
+        if not candles_15m:
+            continue
+        last = candles_15m[-1]
+        rows.append({
+            "symbol": symbol,
+            "timestamp": last.get("timestamp"),
+            "open": last.get("open"),
+            "high": last.get("high"),
+            "low": last.get("low"),
+            "close": last.get("close"),
+            "volume": last.get("volume"),
+            "oi": last.get("oi"),
+        })
+    if rows:
+        st.dataframe(pd.DataFrame(rows).sort_values("symbol"), hide_index=True, use_container_width=True)
+    else:
+        st.info("No 15-minute candle snapshot yet. Start the bot and wait for live ticks, or check historical warm-up files.")
+
 
 # ─── TAB 5: ALPHA INSIGHTS (RSMB vs Existing) ────────────────────────────────
 with tabs[5]:
@@ -844,13 +918,15 @@ with tabs[5]:
             m = calculate_advanced_metrics(df)
             pnl = df["pnl_after_costs"].sum() if not df.empty and "pnl_after_costs" in df.columns else 0.0
             pnl_color = "#00e676" if pnl >= 0 else "#ff4f6e"
+            pf = m.get("profit_factor", 0.0)
+            pf_display = "∞" if pf == float("inf") else f"{pf:.2f}"
             cards = [
                 _kpi_card("Trades", len(df), color),
                 _kpi_card("Net P&L", f"₹{pnl:+.2f}", pnl_color),
-                _kpi_card("Win Rate", f"{m['win_rate']:.1f}%", color),
-                _kpi_card("Profit Factor", f"{m['profit_factor']:.2f}", color),
-                _kpi_card("Expectancy", f"₹{m['expectancy']:.2f}", color),
-                _kpi_card("Max Drawdown", f"₹{m['max_drawdown']:.2f}", "#ff4f6e"),
+                _kpi_card("Win Rate", f"{m.get('win_rate', 0.0):.1f}%", color),
+                _kpi_card("Profit Factor", pf_display, color),
+                _kpi_card("Expectancy", f"₹{m.get('expectancy', 0.0):.2f}", color),
+                _kpi_card("Max Drawdown", f"₹{m.get('max_drawdown', 0.0):.2f}", "#ff4f6e"),
             ]
             return cards
 
