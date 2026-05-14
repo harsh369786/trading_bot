@@ -12,6 +12,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -188,6 +189,90 @@ class TestOrderManagerNormalization(unittest.TestCase):
             await mgr.reconcile_startup_state()
             self.assertEqual(json.loads(redis.store[mgr.KEY_ACTIVE]), {})
         asyncio.run(run())
+
+    def test_square_off_uses_latest_ltp_from_redis(self):
+        async def run():
+            redis = FakeRedis()
+            from execution.order_manager import OrderManager
+            mgr = OrderManager({"paper_mode": True, "instruments": {"equity": ["NIFTY"], "currency": []}}, redis)
+            mgr._journal_path = os.path.join(tempfile.gettempdir(), "square_off_test_journal.csv")
+            await redis.set(mgr.KEY_ACTIVE, json.dumps({
+                "OID1": {
+                    "symbol": "NIFTY", "side": "BUY", "entry": 100.0,
+                    "sl": 99.0, "target": 102.0, "qty": 2, "status": "PROTECTED",
+                    "domain": "equity",
+                }
+            }))
+            await redis.set("bot:ltp:NIFTY", "101.5")
+            await mgr.square_off_all()
+            active = json.loads(redis.store[mgr.KEY_ACTIVE])
+            self.assertEqual(active, {})
+        asyncio.run(run())
+
+    def test_square_off_domain_filter_preserves_other_market(self):
+        async def run():
+            redis = FakeRedis()
+            from execution.order_manager import OrderManager
+            mgr = OrderManager(
+                {
+                    "paper_mode": True,
+                    "instruments": {"equity": ["NIFTY"], "currency": ["USDINR"]},
+                },
+                redis,
+            )
+            with tempfile.TemporaryDirectory() as tmp:
+                mgr._journal_path = os.path.join(tmp, "trade_journal.csv")
+                mgr._ensure_journal_header()
+                await redis.set(mgr.KEY_ACTIVE, json.dumps({
+                    "EQ1": {
+                        "symbol": "NIFTY", "side": "BUY", "entry": 100.0,
+                        "sl": 99.0, "target": 102.0, "qty": 1,
+                        "status": "PROTECTED", "domain": "equity",
+                    },
+                    "CUR1": {
+                        "symbol": "USDINR", "side": "BUY", "entry": 83.0,
+                        "sl": 82.9, "target": 83.2, "qty": 1,
+                        "status": "PROTECTED", "domain": "currency",
+                    },
+                }))
+                await mgr.square_off_all(domain="equity")
+                active = json.loads(redis.store[mgr.KEY_ACTIVE])
+                self.assertNotIn("EQ1", active)
+                self.assertIn("CUR1", active)
+        asyncio.run(run())
+
+
+class TestEquitySignalEngine(unittest.TestCase):
+
+    def test_process_symbol_uses_df_15m_for_feature_validation(self):
+        from strategies.equity_signal_engine import EquitySignalEngine
+
+        feature_cols = [
+            'ema_9', 'ema_21', 'ema_50', 'rsi_14', 'atr_14',
+            'vwap', 'ADX_14', 'DMP_14', 'DMN_14',
+            'BBL_20_2.0', 'BBM_20_2.0', 'BBU_20_2.0'
+        ]
+        idx = pd.date_range("2026-05-14 09:15", periods=60, freq="15min", tz="Asia/Kolkata")
+        df = pd.DataFrame({col: np.ones(len(idx)) for col in feature_cols}, index=idx)
+        df["close"] = 100.0
+
+        engine = EquitySignalEngine.__new__(EquitySignalEngine)
+        engine.config = {"equity_signal": {}, "risk": {}}
+        engine.ensemble = type("FakeEnsemble", (), {"get_combined_score": lambda self, *args: 0.1})()
+        engine.signal_logger = type("FakeLogger", (), {"log_signal": lambda self, **kwargs: None})()
+        engine.risk_engine = None
+        engine.min_buy_conf = 0.62
+        engine.min_sell_conf = 0.62
+        engine.min_rel_vol = 0.0
+        engine.time_features = None
+        engine._last_signal_bar = {}
+        engine.validate_setup = lambda symbol, data, score, side: {"valid": False, "reason": "test"}
+
+        with patch("strategies.equity_signal_engine.PriceFeatures.add_indicators", side_effect=lambda data: data), \
+             patch("strategies.equity_signal_engine.VolumeFeatures.add_volume_analysis", side_effect=lambda data: data):
+            result = asyncio.run(engine.process_symbol("NIFTY", df))
+
+        self.assertIsNone(result)
 
 
 # ---------------------------------------------------------------------------
@@ -687,6 +772,38 @@ class TestPaperEngineActiveSnapshot(unittest.TestCase):
             self.assertEqual(float(df.iloc[-1]["pnl_inr"]), -592.0)
             self.assertEqual(float(df.iloc[-1]["pnl_after_costs"]), -636.0)
 
+    def test_paper_engine_partial_exit_charges_entry_and_each_exit_once(self):
+        from execution.paper_engine import PaperEngine
+        from strategies.base_strategy import Signal
+
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = PaperEngine(
+                cost_per_order_inr=22,
+                journal_path=str(Path(tmp) / "trade_journal.csv"),
+                active_orders_path=str(Path(tmp) / "paper_orders.json"),
+            )
+            signal = Signal(
+                strategy="rsmb",
+                symbol="NIFTY",
+                side="BUY",
+                entry=100,
+                sl=95,
+                target1=105,
+                target2=110,
+                qty=10,
+                score=0.8,
+                rs_rank=1.1,
+                rejection_reason=None,
+                timestamp=pd.Timestamp("2026-05-14 11:15", tz="Asia/Kolkata"),
+            )
+            oid = engine.simulate_fill(signal, 100)
+            self.assertEqual(engine.on_price_update("NIFTY", 105), [(oid, "T1_HIT")])
+            self.assertEqual(engine.on_price_update("NIFTY", 110), [(oid, "T2_HIT")])
+
+            df = pd.read_csv(Path(tmp) / "trade_journal.csv")
+            self.assertEqual(float(df.iloc[-1]["pnl_inr"]), 75.0)
+            self.assertEqual(float(df.iloc[-1]["pnl_after_costs"]), 9.0)
+
 
 # ---------------------------------------------------------------------------
 # Candle Builder Tests (C6, H9)
@@ -772,7 +889,7 @@ class TestCandleBuilder(unittest.TestCase):
             def __init__(self):
                 self.calls = 0
 
-            async def process_symbol(self, symbol, candles):
+            async def process_symbol(self, symbol, candles, timing_candles=None):
                 self.calls += 1
                 return None
 
@@ -818,7 +935,7 @@ class TestCandleBuilder(unittest.TestCase):
             def __init__(self):
                 self.calls = 0
 
-            async def process_symbol(self, symbol, candles):
+            async def process_symbol(self, symbol, candles, timing_candles=None):
                 self.calls += 1
                 return None
 
@@ -848,7 +965,7 @@ class TestCandleBuilder(unittest.TestCase):
         cb.tick_data = {"NIFTY": []}
         cb.candles = {"NIFTY": {"5min": old_5m, "15min": old_15m}}
 
-        ticks = [{"data": {"timestamp": "2026-05-14 09:20:01", "ltp": 101.0, "volume": 100}}]
+        ticks = [{"data": {"timestamp": "2026-05-14 09:30:01", "ltp": 101.0, "volume": 100}}]
 
         async def run():
             await cb._process_ticks_to_candles("NIFTY", ticks)

@@ -19,23 +19,45 @@ class EquitySignalEngine:
         self.signal_logger = SignalLogger()
         self.risk_engine = risk_engine  # Optional: used for position sizing
 
-        self.min_buy_conf = config.get("equity_signal", {}).get("min_buy_confidence", 0.72)
-        self.min_sell_conf = config.get("equity_signal", {}).get("min_sell_confidence", 0.70)
-        self.min_rel_vol = config.get("equity_signal", {}).get("min_relative_volume", 1.0)
+        equity_cfg = config.get("equity_signal", {})
+        self.min_buy_conf = self._float_config(equity_cfg, "min_buy_confidence", 0.62)
+        self.min_sell_conf = self._float_config(equity_cfg, "min_sell_confidence", 0.62)
+        self.min_rel_vol = self._float_config(equity_cfg, "min_relative_volume", 1.0)
         self.time_features = TimeFeatures()
         self._last_signal_bar = {}  # symbol -> timestamp
+        logger.info(
+            "EquitySignalEngine thresholds loaded | "
+            f"buy={self.min_buy_conf:.2f}, sell={self.min_sell_conf:.2f}, rel_vol={self.min_rel_vol:.2f}"
+        )
 
-    async def process_symbol(self, symbol: str, df: pd.DataFrame):
+    @staticmethod
+    def _float_config(section: dict, key: str, default: float) -> float:
+        try:
+            return float(section.get(key, default))
+        except (TypeError, ValueError):
+            logger.warning(f"Invalid equity_signal.{key}; using default {default}")
+            return default
+
+    async def process_symbol(self, symbol: str, df_15m: pd.DataFrame, df_5m: pd.DataFrame = None):
         """
-        Called when a new candle closes.
-        Computes features -> AI Inference -> Signal Validation.
+        Dual-Timeframe Engine:
+        - Brain: 15m candles (indicators, AI inference).
+        - Feet: 5m candles (entry timing and VWAP validation).
         """
-        # 1. Add all technical indicators
-        df = PriceFeatures.add_indicators(df)
-        df = VolumeFeatures.add_volume_analysis(df)
+        if df_15m is None or df_15m.empty:
+            return None
+
+        # 0. Deduplication check (Hoist to prevent double logging)
+        last_ts = df_15m.index[-1]
+        if last_ts is not None and self._last_signal_bar.get(symbol) == last_ts:
+            return None 
+
+        # 1. Brain: 15m Indicator Calculation
+        df_15m = PriceFeatures.add_indicators(df_15m)
+        df_15m = VolumeFeatures.add_volume_analysis(df_15m)
         
-        if len(df) < 50: 
-            return
+        if len(df_15m) < 50: 
+            return None
 
         # 2. Prepare Features for AI (Align with Training)
         feature_cols = [
@@ -44,42 +66,42 @@ class EquitySignalEngine:
             'BBL_20_2.0', 'BBM_20_2.0', 'BBU_20_2.0'
         ]
         
-        missing_cols = [col for col in feature_cols if col not in df.columns]
+        missing_cols = [col for col in feature_cols if col not in df_15m.columns]
         if missing_cols:
             logger.warning(f"NO TRADE {symbol}: missing feature columns {missing_cols}")
             return None
 
-        current_df = df.tail(1)[feature_cols]
+        current_df = df_15m.tail(1)[feature_cols]
         if current_df.isna().any(axis=None):
-            logger.debug(f"NO TRADE {symbol}: latest feature row contains NaN values")
             return None
-        current_features = current_df.values # Shape (1, 12)
+        current_features = current_df.values 
         
-        # Sequence features for LSTM (Placeholder/Internal)
-        sequence_features = df.tail(30).values 
-        returns = df['close'].pct_change().tail(50).values
+        sequence_features = df_15m.tail(30)[feature_cols].values 
+        returns = df_15m['close'].pct_change().tail(50).values
         
-        # 3. Get AI Score from Ensemble
+        # Get AI Score from Ensemble (Trained on 15m)
         ai_score = self.ensemble.get_combined_score(current_features, sequence_features, returns)
         
-        # 4. Validate Signal
+        # 3. Feet: Validate Signal using 5m data (Timing Layer)
         side = "BUY" if ai_score > 0 else "SELL"
-        validation = self.validate_setup(symbol, df, abs(ai_score), side)
         
-        # Deduplication check
-        last_ts = df.index[-1] if not df.empty and isinstance(df.index, pd.DatetimeIndex) else None
-        if last_ts and self._last_signal_bar.get(symbol) == last_ts:
-            return None  # Already fired a signal for this candle
-            
+        # If no 5m data provided, fallback to 15m for validation
+        if df_5m is not None and not df_5m.empty:
+            timing_df = PriceFeatures.add_indicators(df_5m)
+        else:
+            timing_df = df_15m   # indicators already computed in Brain layer
+        
+        validation = self.validate_setup(symbol, timing_df, abs(ai_score), side)
+        
+        # 4. LOG TO CSV (For Dashboard)
+        status = "TRADE" if validation['valid'] else "NO_TRADE"
         if validation['valid']:
             self._last_signal_bar[symbol] = last_ts
+            reason = f"AI: {abs(ai_score):.2f} | 5m-ADX: {validation['metrics']['adx']:.1f} | 15m-Brain Valid"
+        else:
+            reason = validation['reason']
         
-        # 5. LOG TO CSV (For Dashboard)
-        status = "TRADE" if validation['valid'] else "NO_TRADE"
-        reason = "" if validation['valid'] else validation['reason']
-        
-        # Calculate dummy SL/Target for log if not valid (for visualization)
-        entry = df.iloc[-1]['close']
+        entry = float(timing_df.iloc[-1]['close'])
         sl = validation.get('sl', entry * 0.99)
         target = validation.get('target', entry * 1.02)
         
@@ -96,76 +118,67 @@ class EquitySignalEngine:
         )
 
         if validation['valid']:
-            logger.info(f"🚀 EQUITY SIGNAL: {side} {symbol} | Conf: {abs(ai_score):.2f}")
+            logger.info(f"🚀 ENSEMBLE SIGNAL: {side} {symbol} | Brain(15m): {abs(ai_score):.2f} | Feet(5m) Valid")
 
-            # Position sizing via RiskEngine if available (C2 fix)
-            qty = 1  # safe fallback
+            qty = 1 
             if self.risk_engine is not None:
-                sized_qty = self.risk_engine.get_equity_position_size(
-                    validation.get("entry", entry),
-                    validation.get("sl", sl),
-                )
+                sized_qty = self.risk_engine.get_equity_position_size(entry, sl)
                 if sized_qty > 0:
                     qty = sized_qty
-                else:
-                    logger.warning(f"RiskEngine returned qty=0 for {symbol}; using qty=1 fallback.")
 
-            # Construct full signal for OrderManager
-            full_signal = {
+            return {
                 "symbol": symbol,
                 "side": side,
                 "strategy": "Ensemble_AI",
                 "qty": qty,
-                "entry": validation.get("entry", entry),
-                "sl": validation.get("sl", sl),
-                "target": validation.get("target", target),
+                "entry": entry,
+                "sl": sl,
+                "target": target,
                 "confidence": abs(ai_score),
             }
-            return full_signal
             
         return None
 
     def validate_setup(self, symbol: str, df: pd.DataFrame, ai_score: float, side: str) -> Dict[str, Any]:
         """
-        Validates a signal using the strict requirements from Module 3.
+        Validates the entry timing on the provided dataframe (usually 5m).
         """
-        if df.empty or len(df) < 50:
-            return {"valid": False, "reason": "Insufficient data"}
+        if df.empty or len(df) < 20:
+            return {"valid": False, "reason": "Insufficient timing data"}
 
         last_row = df.iloc[-1]
         
-        # 1. Check AI Confidence
+        # 1. AI Score (Passed from 15m Brain)
         target_conf = self.min_buy_conf if side == "BUY" else self.min_sell_conf
         if ai_score < target_conf:
-            return {"valid": False, "reason": f"Low AI confidence: {ai_score:.2f}"}
+            return {"valid": False, "reason": f"Low AI confidence (15m): {ai_score:.2f}"}
 
-        # 2. Check Time Filters
+        # 2. Session Filters
         df_flags = self.time_features.add_session_flags(df.tail(1))
         if df_flags['is_noise_window'].iloc[0]:
             return {"valid": False, "reason": "Inside noise window"}
-        if df_flags['is_chop_zone'].iloc[0]:
-            # Optional: apply higher threshold in chop zone
-            pass
 
-        # 3. Trend Alignment (EMA 9 > 21 > 50 for BUY)
+        # 3. Timing: EMA Alignment (using 5m EMA)
         ema_aligned = False
         if side == "BUY":
-            ema_aligned = last_row['ema_9'] > last_row['ema_21'] > last_row['ema_50']
+            ema_aligned = last_row['ema_9'] > last_row['ema_21']
         else:
-            ema_aligned = last_row['ema_9'] < last_row['ema_21'] < last_row['ema_50']
+            ema_aligned = last_row['ema_9'] < last_row['ema_21']
             
         if not ema_aligned:
-            return {"valid": False, "reason": f"EMA not aligned for {side}"}
+            return {"valid": False, "reason": "5m EMAs not aligned (timing)"}
 
-        # 4. VWAP Position
+        # 4. Timing: VWAP Position (5m price relative to 5m VWAP)
         if side == "BUY" and last_row['close'] < last_row['vwap']:
-            return {"valid": False, "reason": "Price below VWAP"}
+            return {"valid": False, "reason": "5m Price below VWAP (timing)"}
         if side == "SELL" and last_row['close'] > last_row['vwap']:
-            return {"valid": False, "reason": "Price above VWAP"}
+            return {"valid": False, "reason": "5m Price above VWAP (timing)"}
 
-        # 5. Trend Strength (ADX > 20)
-        if last_row['ADX_14'] < 20:
-            return {"valid": False, "reason": "Weak trend (ADX < 20)"}
+        # 5. Trend Strength (ADX on timing timeframe)
+        import math
+        adx = last_row.get('ADX_14', float('nan'))
+        if math.isnan(adx) or adx < 15: # Lowered to 15 for timing layer
+            return {"valid": False, "reason": f"Weak or missing 5m momentum (ADX: {adx})"}
 
         # 6. Volume filter (H6 fix: reject zero-volume/low-volume candles)
         rel_vol = last_row.get("rel_vol", 0)

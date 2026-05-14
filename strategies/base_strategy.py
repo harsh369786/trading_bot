@@ -26,6 +26,7 @@ class Signal:
     rs_rank: Optional[float]
     rejection_reason: Optional[str]
     timestamp: pd.Timestamp
+    id: Optional[str] = None
 
 
 class BaseStrategy(ABC):

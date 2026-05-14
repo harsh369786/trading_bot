@@ -1,6 +1,8 @@
 import asyncio
 import yaml
 import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from loguru import logger
 from dotenv import load_dotenv
 
@@ -28,6 +30,8 @@ from reporting.daily_report_publisher import DailyReportPublisher
 load_dotenv()
 
 from config.logging_config import setup_logging
+
+IST = ZoneInfo("Asia/Kolkata")
 
 async def heartbeat():
     """Simple task to show the bot is still alive in the console."""
@@ -64,7 +68,7 @@ async def main():
     from risk.risk_engine import RiskEngine
     risk_engine = RiskEngine(config, redis_client)
 
-    order_manager = OrderManager(config, redis_client)
+    order_manager = OrderManager(config, redis_client, risk_engine=risk_engine)
     # Pass risk_engine to equity engine so position sizing is ATR-based (C2 fix)
     equity_engine = EquitySignalEngine(config, risk_engine=risk_engine)
     currency_engine = CurrencyAgentPipeline(config)
@@ -108,20 +112,62 @@ async def main():
     
     async def poll_vix():
         """Feed live VIX to RSMB strategy every 5 minutes."""
-        import redis.asyncio as aioredis
         while True:
             try:
-                rc = aioredis.from_url(
-                    os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
-                    decode_responses=True
-                )
-                vix_raw = await rc.get("market:vix:latest")
-                await rc.aclose()
+                vix_raw = await redis_client.get("market:vix:latest")
                 if vix_raw:
                     rsmb_strategy.update_vix(float(vix_raw))
             except Exception as exc:
                 logger.debug(f"VIX poll: {exc}")
             await asyncio.sleep(300)  # 5 minutes
+
+    async def market_monitor():
+        """Monitor IST market close windows for EOD square-off."""
+        equity_square_off_done = False
+        currency_square_off_done = False
+
+        async def latest_prices_for_open_paper_orders() -> dict:
+            prices = {}
+            try:
+                active_orders = paper_engine.get_active_orders()
+            except Exception as exc:
+                logger.debug(f"Could not inspect paper orders for EOD pricing: {exc}")
+                return prices
+
+            for order in active_orders:
+                try:
+                    raw = await redis_client.get(f"bot:ltp:{order.symbol}")
+                    if raw is not None:
+                        prices[order.symbol] = float(raw)
+                except Exception as exc:
+                    logger.warning(f"Could not read latest LTP for paper {order.symbol}: {exc}")
+            return prices
+
+        while True:
+            now = datetime.now(IST)
+            # Square off at 15:20 IST
+            if now.hour == 15 and now.minute >= 20 and not equity_square_off_done:
+                logger.warning("🏁 Market close approaching (15:20 IST). Squaring off all positions...")
+                # 1. Square off RSMB Paper Engine
+                latest_prices = await latest_prices_for_open_paper_orders()
+                paper_engine.square_off_all(latest_prices)
+                # 2. Square off Existing Strategy OrderManager
+                await order_manager.square_off_all(domain="equity")
+                equity_square_off_done = True
+                logger.success("✅ EOD Square-off complete.")
+            
+            if now.hour >= 17 and not currency_square_off_done:
+                logger.warning("Currency market close reached (17:00 IST). Squaring off currency positions...")
+                await order_manager.square_off_all(domain="currency")
+                currency_square_off_done = True
+                logger.success("Currency EOD square-off complete.")
+
+            if now.hour < 15: 
+                equity_square_off_done = False
+            if now.hour < 9: # Reset currency only after midnight/before market open
+                currency_square_off_done = False
+            
+            await asyncio.sleep(60)
 
     try:
         # Run live services
@@ -132,13 +178,25 @@ async def main():
             tracker.run(),
             heartbeat(),
             poll_vix(),
+            market_monitor(),
         )
     except KeyboardInterrupt:
         logger.info("Shutdown requested.")
     except Exception as e:
         logger.critical(f"System crash: {e}")
     finally:
-        # 4. Nightly Cleanup & Learning (Runs at 15:30 in real scenario)
+        # Final safety square-off
+        logger.info("Performing final safety square-off...")
+        final_prices = {}
+        try:
+            for order in paper_engine.get_active_orders():
+                raw = await redis_client.get(f"bot:ltp:{order.symbol}")
+                if raw is not None:
+                    final_prices[order.symbol] = float(raw)
+        except Exception as exc:
+            logger.warning(f"Could not load final paper square-off prices: {exc}")
+        paper_engine.square_off_all(final_prices)
+        await order_manager.square_off_all()
         stats = analyzer.get_stats()
         learner.tune_parameters(stats)
         report = reporter.format_daily_summary(stats)

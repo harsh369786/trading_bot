@@ -175,11 +175,17 @@ class RSMBStrategy(BaseStrategy):
                 self._log_signal(symbol, signal.side, 0, 0, 0, ai_score, "NO_TRADE", "max_open_trades", rs_rank)
                 return None
 
+            take_reason = f"RS Rank: {rs_rank:.2f} | AI: {ai_score:.2f} | Setup Valid"
             self._log_signal(
                 symbol, signal.side,
                 signal.entry, signal.sl, signal.target1,
-                ai_score, "TRADE", "", rs_rank
+                ai_score, "TRADE", take_reason, rs_rank
             )
+            
+            # Reservation Fix: register PENDING position immediately to reserve capacity (Module 3 fix)
+            pos_id = self._position_manager.open_position(signal)
+            signal.id = pos_id
+            
             return signal
 
         return None
@@ -190,10 +196,10 @@ class RSMBStrategy(BaseStrategy):
 
     def on_fill(self, signal: Signal, fill_price: float) -> None:
         """Called when PaperEngine fills the order."""
-        pos_id = self._position_manager.open_position(signal)
-        if pos_id:
+        # Note: open_position was already called in on_bar to reserve capacity
+        if signal.id:
             ts = pd.Timestamp.now(tz="Asia/Kolkata")
-            self._position_manager.on_fill(pos_id, fill_price, ts)
+            self._position_manager.on_fill(signal.id, fill_price, ts)
 
     def on_target_hit(self, signal: Signal, target_num: int) -> None:
         logger.info(f"RSMBStrategy: {signal.symbol} target {target_num} hit")
@@ -209,8 +215,8 @@ class RSMBStrategy(BaseStrategy):
         """Forward price to position manager for SL/T1/T2 monitoring."""
         events = self._position_manager.on_price_update(price, symbol=symbol)
         if events:
-            for pos_id, event in events:
-                logger.info(f"RSMB position {pos_id}: {event} @ {price:.2f}")
+            for pos_id, event, exit_price in events:
+                logger.info(f"RSMB position {pos_id}: {event} @ {exit_price:.2f}")
 
     # ------------------------------------------------------------------
     # Trailing stop update (call on each new 15m bar for partial positions)
@@ -263,10 +269,10 @@ class RSMBStrategy(BaseStrategy):
             atr = float(atr_s.iloc[-1]) if not atr_s.empty else 0.0
             vol_ratio = float(vol_ratio_s.iloc[-1]) if not vol_ratio_s.empty else 1.0
 
-            # Bollinger for bb_width feature
-            bb_upper = float(df_15m.get("BBU_20_2.0", pd.Series([0.0])).iloc[-1])
-            bb_lower = float(df_15m.get("BBL_20_2.0", pd.Series([0.0])).iloc[-1])
-            adx = float(df_15m.get("ADX_14", pd.Series([0.0])).iloc[-1])
+            # Bollinger and ADX for features (Module 1 optimization)
+            bb_upper = float(df_15m["BBU_20_2.0"].iloc[-1]) if "BBU_20_2.0" in df_15m.columns else 0.0
+            bb_lower = float(df_15m["BBL_20_2.0"].iloc[-1]) if "BBL_20_2.0" in df_15m.columns else 0.0
+            adx = float(df_15m["ADX_14"].iloc[-1]) if "ADX_14" in df_15m.columns else 0.0
 
             features = RSMBAIFilter.extract_features(
                 bar=bar,

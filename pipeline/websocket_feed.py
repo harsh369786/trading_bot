@@ -5,6 +5,7 @@ import threading
 from datetime import datetime, time
 
 import pytz
+import pandas as pd
 from loguru import logger
 
 from .redis_queue import RedisQueue
@@ -203,11 +204,33 @@ class WebSocketFeed:
             "BANKNIFTY": 48200.0,
             "RELIANCE": 2950.0,
             "HDFCBANK": 1520.0,
+            "INFY": 1450.0,
+            "TCS": 3900.0,
+            "ICICIBANK": 1100.0,
+            "SBIN": 820.0,
+            "AXISBANK": 1150.0,
+            "KOTAKBANK": 1750.0,
+            "LT": 3600.0,
+            "WIPRO": 450.0,
+            "BAJFINANCE": 7200.0,
+            "TMPV": 950.0,
+            "TATASTEEL": 150.0,
+            "ADANIPORTS": 1350.0,
             "USDINR": 83.45,
             "EURINR": 90.12,
             "GBPINR": 105.30,
             "JPYINR": 0.54,
         }
+        for symbol in self.symbols:
+            path = os.path.join("data", "historical", f"{symbol}_6m.parquet")
+            if symbol in base_prices or not os.path.exists(path):
+                continue
+            try:
+                hist = pd.read_parquet(path, columns=["close"])
+                if not hist.empty:
+                    base_prices[symbol] = float(hist["close"].dropna().iloc[-1])
+            except Exception as exc:
+                logger.debug(f"Simulator could not seed {symbol} from history: {exc}")
 
         while True:
             for symbol in self.symbols:

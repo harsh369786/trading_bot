@@ -22,7 +22,10 @@ class TradeLifecycleTracker:
                 await asyncio.sleep(1)
                 continue
 
-            active_orders = await self.order_manager._get_active_orders()
+            if hasattr(self.order_manager, "get_active_orders"):
+                active_orders = await self.order_manager.get_active_orders()
+            else:
+                active_orders = await self.order_manager._get_active_orders()
             my_trades = {
                 oid: trade
                 for oid, trade in active_orders.items()
@@ -47,7 +50,11 @@ class TradeLifecycleTracker:
                         side = trade["side"]
                         entry = float(trade["entry"])
                         sl = float(trade["sl"])
-                        target = float(trade.get("target", trade.get("t1")))
+                        target_raw = trade.get("target") or trade.get("t1")
+                        if target_raw is None:
+                            logger.error(f"Active trade {oid} has no target/t1 field: {trade}")
+                            continue
+                        target = float(target_raw)
                     except (KeyError, TypeError, ValueError):
                         logger.error(f"Active trade {oid} has invalid SL/target fields: {trade}")
                         continue

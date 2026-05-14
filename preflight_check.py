@@ -354,6 +354,14 @@ class Preflight:
             self.ok("Paper active orders", f"{len(rows)} active paper order(s) validated.")
 
     def check_historical_warmup(self) -> None:
+        """Sync missing morning data, then check if warm-up files are ready."""
+        print("       (Live Sync) Fetching missing morning candles...")
+        try:
+            # Call our new sync utility
+            subprocess.run([sys.executable, "-B", "pipeline/data_sync.py"], check=False, capture_output=True)
+        except Exception as exc:
+            self.warn("Historical warm-up", f"Live sync script failed: {exc}")
+
         instruments = self.config.get("instruments", {})
         symbols = instruments.get("equity", []) + instruments.get("currency", [])
         if not symbols:

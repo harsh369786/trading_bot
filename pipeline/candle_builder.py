@@ -9,6 +9,7 @@ from typing import Dict, List
 import pandas as pd
 import pytz
 from loguru import logger
+from features.price_features import PriceFeatures
 
 
 class CandleBuilder:
@@ -28,6 +29,7 @@ class CandleBuilder:
         self.candle_snapshot_path = config.get("dashboard", {}).get(
             "candle_snapshot_path", "data/candle_snapshot.json"
         )
+        self._last_snapshot_ts = 0.0
         self.tick_data: Dict[str, List[dict]] = {sym: [] for sym in self.symbols}
         self.candles: Dict[str, Dict[str, pd.DataFrame]] = {
             sym: {tf: pd.DataFrame() for tf in self.timeframes} for sym in self.symbols
@@ -172,6 +174,11 @@ class CandleBuilder:
         latest_ltp = pd.to_numeric(df_ticks["ltp"], errors="coerce").dropna()
         if not latest_ltp.empty:
             latest_price = float(latest_ltp.iloc[-1])
+            if self.redis_queue is not None and getattr(self.redis_queue, "client", None) is not None:
+                try:
+                    await self.redis_queue.client.set(f"bot:ltp:{symbol}", latest_price, ex=3600)
+                except Exception as exc:
+                    logger.debug(f"Could not persist latest LTP for {symbol}: {exc}")
             paper_engine = getattr(self, "paper_engine", None)
             rsmb_strategy = getattr(self, "rsmb_strategy", None)
             if paper_engine is not None:
@@ -206,32 +213,16 @@ class CandleBuilder:
                 else:
                     existing_df.index = existing_df.index.tz_convert(ist)
 
-            updated_df = incoming_df.combine_first(existing_df).sort_index().tail(1000)
+            updated_df = (
+                pd.concat([existing_df, incoming_df])
+                .loc[lambda frame: ~frame.index.duplicated(keep="last")]
+                .sort_index()
+                .tail(1000)
+            )
             old_last_ts = existing_df.index[-1] if not existing_df.empty else None
             new_last_ts = updated_df.index[-1] if not updated_df.empty else None
             self.candles[symbol][tf] = updated_df
 
-            if (
-                tf == "5min"
-                and old_last_ts is not None
-                and new_last_ts is not None
-                and new_last_ts > old_last_ts
-                and self._is_live_session_close(symbol, old_last_ts, new_last_ts)
-            ):
-                closed_candle_ts = old_last_ts
-                closed_5m = self.candles[symbol][tf].loc[:closed_candle_ts].copy()
-                closed_15m = self.candles[symbol]["15min"].loc[:closed_candle_ts].copy()
-                logger.success(f"Candle closed (5min) for {symbol} at {closed_candle_ts}. Triggering engines.")
-
-                if symbol in self.config.get("instruments", {}).get("equity", []):
-                    signal = await self.equity_engine.process_symbol(symbol, closed_5m)
-                else:
-                    signal = await self.currency_engine.process_symbol(symbol, closed_5m, closed_15m)
-
-                if signal and self.order_manager:
-                    await self.order_manager.execute_signal(signal)
-
-            # --- RSMB 15m candle hook (independent of existing strategies) ---
             if (
                 tf == "15min"
                 and old_last_ts is not None
@@ -239,37 +230,53 @@ class CandleBuilder:
                 and new_last_ts > old_last_ts
                 and self._is_live_session_close(symbol, old_last_ts, new_last_ts)
             ):
+                # Signal engines only need the recent tail for indicators/AI (Module 4 fix)
+                closed_15m = self.candles[symbol]["15min"].loc[:old_last_ts].tail(200).copy()
+                closed_5m = self.candles[symbol]["5min"].loc[:old_last_ts].tail(200).copy()
+                logger.success(f"Candle closed (15min) for {symbol} at {old_last_ts}. Triggering engines.")
+
+                if symbol in self.config.get("instruments", {}).get("equity", []):
+                    signal = await self.equity_engine.process_symbol(symbol, closed_15m, closed_5m)
+                else:
+                    signal = await self.currency_engine.process_symbol(symbol, closed_5m, closed_15m)
+
+                if signal and self.order_manager:
+                    await self.order_manager.execute_signal(signal)
+
+                # --- RSMB 15m candle hook (independent of existing strategies) ---
                 if self.rsmb_strategy is not None:
-                    closed_15m = self.candles[symbol]["15min"].loc[:old_last_ts].copy()
+                    closed_15m_rsmb = closed_15m.copy()
                     
                     # Calculate features required by XGBoost AI filter
-                    from features.price_features import PriceFeatures
                     try:
                         from ta.trend import MACD
-                        macd = MACD(close=closed_15m['close'], window_slow=26, window_fast=12, window_sign=9)
-                        closed_15m['macd_hist'] = macd.macd_diff()
+                        macd = MACD(close=closed_15m_rsmb['close'], window_slow=26, window_fast=12, window_sign=9)
+                        closed_15m_rsmb['macd_hist'] = macd.macd_diff()
                     except Exception:
                         pass
-                    closed_15m = PriceFeatures.add_indicators(closed_15m)
+                    closed_15m_rsmb = PriceFeatures.add_indicators(closed_15m_rsmb)
                     
                     # Compute and push daily closes for RS_Rank calculation (lookback=20 days)
-                    if not closed_15m.empty:
-                        daily_closes = closed_15m['close'].resample("D").last().dropna()
+                    if not closed_15m_rsmb.empty:
+                        daily_closes = closed_15m_rsmb['close'].resample("D").last().dropna()
                         self.rsmb_strategy.push_daily(symbol, daily_closes)
                     
-                    self.rsmb_strategy.push_bar(symbol, closed_15m)
+                    self.rsmb_strategy.push_bar(symbol, closed_15m_rsmb)
                     self.rsmb_strategy.update_trailing_stops(symbol)
-                    bar = closed_15m.iloc[-1] if not closed_15m.empty else None
+                    bar = closed_15m_rsmb.iloc[-1] if not closed_15m_rsmb.empty else None
                     if bar is not None:
                         rsmb_signal = self.rsmb_strategy.on_bar(symbol, bar)
                         if rsmb_signal and self.paper_engine:
-                            # Fill at next bar open (use current last close as proxy in paper mode)
-                            next_open = float(self.candles[symbol]["15min"].iloc[-1].get("open", rsmb_signal.entry))
+                            # Conservative paper fill: use signal entry until a true next-bar open is available.
+                            next_open = float(rsmb_signal.entry)
                             order_id = self.paper_engine.simulate_fill(rsmb_signal, next_open)
                             self.rsmb_strategy.on_fill(rsmb_signal, next_open)
                             logger.success(f"RSMB order {order_id}: {rsmb_signal.side} {symbol} filled @ {next_open:.2f}")
 
-        self._write_candle_snapshot()
+        now = time_module.monotonic()
+        if now - getattr(self, "_last_snapshot_ts", 0.0) >= 5.0:
+            self._write_candle_snapshot()
+            self._last_snapshot_ts = now
 
     async def run(self):
         """Consume ticks and build candles."""

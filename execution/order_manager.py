@@ -2,6 +2,7 @@ import json
 import math
 import os
 import time
+import uuid
 from datetime import datetime
 from typing import Dict
 
@@ -20,12 +21,12 @@ class OrderManager:
     Handles order lifecycle: entry, stop-loss, and targets.
     State is persisted in Redis to survive restarts.
     """
-    def __init__(self, config: dict, redis_client=None, broker: BaseBroker = None):
+    def __init__(self, config: dict, redis_client=None, broker: BaseBroker = None, risk_engine=None):
         self.config = config
         self.redis = redis_client
         self.broker = broker or MockBroker()
         self.KEY_ACTIVE = "bot:execution:active_orders"
-        self.risk_engine = RiskEngine(config, redis_client)
+        self.risk_engine = risk_engine or RiskEngine(config, redis_client)
         self.paper_mode = bool(config.get("paper_mode", True))
         self.live_enabled = os.environ.get("TRADING_MODE", "paper").strip().lower() == "live"
         # Configurable cost fraction (M4 fix)
@@ -41,6 +42,10 @@ class OrderManager:
             return {}
         data = await self.redis.get(self.KEY_ACTIVE)
         return json.loads(data) if data else {}
+
+    async def get_active_orders(self) -> Dict[str, dict]:
+        """Public read-only accessor for active order state."""
+        return await self._get_active_orders()
 
     async def _save_active_orders(self, orders: Dict[str, dict]):
         if not self.redis:
@@ -85,10 +90,16 @@ class OrderManager:
                 dropped += 1
                 continue
 
-            if symbol in seen_symbols:
+            strategy = order.get("strategy", "Unknown")
+            seen_key = (symbol, strategy)
+            if seen_key in seen_symbols:
+                logger.warning(
+                    f"Startup reconcile: dropping duplicate {symbol} order for {strategy} "
+                    f"order_id={order_id} (first occurrence kept)"
+                )
                 dropped += 1
                 continue
-            seen_symbols.add(symbol)
+            seen_symbols.add(seen_key)
             order["order_id"] = order.get("order_id", order_id)
             order["domain"] = order.get("domain") or self._domain_for_symbol(symbol)
             cleaned[order_id] = order
@@ -256,7 +267,7 @@ class OrderManager:
                 elif len(row) == len(fieldnames):
                     repaired.append(row)
 
-            tmp_path = f"{self._journal_path}.tmp"
+            tmp_path = f"{self._journal_path}.{uuid.uuid4().hex}.tmp"
             with open(tmp_path, "w", newline="") as f:
                 csv.writer(f).writerows(repaired)
             os.replace(tmp_path, self._journal_path)
@@ -397,3 +408,40 @@ class OrderManager:
                 time.sleep(0.2)
 
         logger.info(f"Trade journal updated: {trade['symbol']} | PnL: {log_data['pnl_inr']:.2f} | Net: {log_data['pnl_after_costs']:.2f}")
+
+    async def square_off_all(self, domain: str | None = None):
+        """Close active PROTECTED/PENDING orders at market price.
+
+        Optional domain filtering keeps equity and currency EOD square-offs on
+        their correct market schedules.
+        """
+        active = await self._get_active_orders()
+        if not active:
+            return
+
+        active_items = []
+        for oid, trade in list(active.items()):
+            trade_domain = trade.get("domain", self._domain_for_symbol(trade.get("symbol", "")))
+            if domain is None or trade_domain == domain:
+                active_items.append((oid, trade))
+
+        if not active_items:
+            return
+
+        label = f"{domain} " if domain else ""
+        logger.warning(f"OrderManager: Squaring off {len(active_items)} active {label}positions (EOD).")
+        for oid, trade in active_items:
+            exit_price = trade.get("last_price") or trade.get("entry")
+            if self.redis is not None:
+                try:
+                    raw = await self.redis.get(f"bot:ltp:{trade['symbol']}")
+                    if raw is not None:
+                        exit_price = float(raw)
+                except (TypeError, ValueError, KeyError) as exc:
+                    logger.warning(f"Could not read latest LTP for {trade.get('symbol')}: {exc}")
+            await self.handle_order_update({
+                "order_id": oid,
+                "status": "EOD_SQUAREOFF",
+                "price": exit_price,
+                "is_exit": True,
+            })

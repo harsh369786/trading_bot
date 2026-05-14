@@ -8,9 +8,9 @@ Spec compliance:
 - SL, T1, T2 managed on every price update
 - T1: close 50% qty, move SL to breakeven
 - T2: close remaining
-- P&L includes cost_per_order_inr × 2 (entry + exit) per position
-- All order book mutations under threading.Lock
-- get_strategy_stats() returns per-strategy performance dict
+- P&L deducts cost_per_order_inr per brokerage leg:
+- Full-exit trades: 2× total (Entry + Exit)
+- T1+T2 trades: 3× total (Entry + T1 + T2)
 """
 from __future__ import annotations
 
@@ -83,12 +83,52 @@ class PaperEngine:
         active_orders_path: str = "data/paper_orders.json",
     ) -> None:
         self._orders: Dict[str, Order] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._cost_per_order = cost_per_order_inr
         self._journal_path = journal_path
         self._active_orders_path = active_orders_path
+        self._load_active_orders()
         self._ensure_journal_header()
         self._write_active_snapshot()
+
+    def _load_active_orders(self) -> None:
+        """Reload ACTIVE/PARTIAL orders from disk to survive bot restarts."""
+        if not os.path.exists(self._active_orders_path):
+            return
+        try:
+            with open(self._active_orders_path, "r", encoding="utf-8") as f:
+                rows = json.load(f)
+            if not isinstance(rows, list):
+                return
+            
+            with self._lock:
+                for row in rows:
+                    try:
+                        order_id = row["order_id"]
+                        order = Order(
+                            order_id=order_id,
+                            strategy=row["strategy"],
+                            symbol=row["symbol"],
+                            side=row["side"],
+                            entry=row["entry"],
+                            sl=row["sl"],
+                            target1=row.get("target1", row.get("target", 0)),
+                            target2=row.get("target2", 0),
+                            qty=row["qty"],
+                            qty_open=row["qty_open"],
+                            fill_price=row["entry"],
+                            score=row.get("confidence", 0),
+                            status=row["status"],
+                            pnl_unrealised=row.get("pnl_unrealised", 0),
+                            pnl_realised=row.get("pnl_realised", 0),
+                            entry_time=row.get("entry_time"),
+                        )
+                        self._orders[order_id] = order
+                    except KeyError as e:
+                        logger.warning(f"PaperEngine: skipping malformed order row during reload: {e}")
+            logger.info(f"PaperEngine: reloaded {len(self._orders)} active orders from disk.")
+        except Exception as exc:
+            logger.error(f"PaperEngine: failed to reload active orders: {exc}")
 
     # ------------------------------------------------------------------
     # Order intake
@@ -126,6 +166,7 @@ class PaperEngine:
             rs_rank=signal.rs_rank,
             status="ACTIVE",
             entry_time=now_ist,
+            pnl_realised=-self._cost_per_order,
         )
 
         with self._lock:
@@ -164,37 +205,36 @@ class PaperEngine:
             ]
 
         for order_id, order in relevant:
-            side = order.side
-
-            # Update unrealised P&L
+            event = None
             with self._lock:
-                if order.status in ("ACTIVE", "PARTIAL"):
-                    if side == "BUY":
-                        order.pnl_unrealised = (price - order.fill_price) * order.qty_open
-                    else:
-                        order.pnl_unrealised = (order.fill_price - price) * order.qty_open
+                if order.status not in ("ACTIVE", "PARTIAL"):
+                    continue
 
-            # Check exits
-            if side == "BUY":
-                if price <= order.sl:
-                    self._close_position(order_id, price, "SL_HIT")
-                    events.append((order_id, "SL_HIT"))
-                elif order.status == "PARTIAL" and price >= order.target2:
-                    self._close_position(order_id, price, "TARGET_HIT")
-                    events.append((order_id, "T2_HIT"))
-                elif order.status == "ACTIVE" and price >= order.target1:
-                    self._hit_t1(order_id, price)
-                    events.append((order_id, "T1_HIT"))
-            else:  # SELL
-                if price >= order.sl:
-                    self._close_position(order_id, price, "SL_HIT")
-                    events.append((order_id, "SL_HIT"))
-                elif order.status == "PARTIAL" and price <= order.target2:
-                    self._close_position(order_id, price, "TARGET_HIT")
-                    events.append((order_id, "T2_HIT"))
-                elif order.status == "ACTIVE" and price <= order.target1:
-                    self._hit_t1(order_id, price)
-                    events.append((order_id, "T1_HIT"))
+                side = order.side
+                if side == "BUY":
+                    order.pnl_unrealised = (price - order.fill_price) * order.qty_open
+                    if price <= order.sl:
+                        event = "SL_HIT"
+                    elif order.status == "PARTIAL" and price >= order.target2:
+                        event = "T2_HIT"
+                    elif order.status == "ACTIVE" and price >= order.target1:
+                        event = "T1_HIT"
+                else:
+                    order.pnl_unrealised = (order.fill_price - price) * order.qty_open
+                    if price >= order.sl:
+                        event = "SL_HIT"
+                    elif order.status == "PARTIAL" and price <= order.target2:
+                        event = "T2_HIT"
+                    elif order.status == "ACTIVE" and price <= order.target1:
+                        event = "T1_HIT"
+
+            if event == "T1_HIT":
+                if self._hit_t1(order_id, price):
+                    events.append((order_id, event))
+            elif event in {"SL_HIT", "T2_HIT"}:
+                outcome = "TARGET_HIT" if event == "T2_HIT" else event
+                if self._close_position(order_id, price, outcome):
+                    events.append((order_id, event))
 
         return events
 
@@ -202,16 +242,16 @@ class PaperEngine:
     # Exit handlers
     # ------------------------------------------------------------------
 
-    def _hit_t1(self, order_id: str, exit_price: float) -> None:
+    def _hit_t1(self, order_id: str, exit_price: float) -> bool:
         """Book 50% of qty at T1, move SL to breakeven."""
         with self._lock:
             order = self._orders.get(order_id)
             if order is None or order.status != "ACTIVE":
-                return
+                return False
 
             t1_qty = max(1, order.qty_open // 2)
             gross = self._calc_gross(order.side, order.fill_price, exit_price, t1_qty)
-            net = gross - (self._cost_per_order * 2)
+            net = gross - self._cost_per_order
 
             order.pnl_gross_realised += gross
             order.pnl_realised += net
@@ -228,16 +268,17 @@ class PaperEngine:
         )
 
         self._write_active_snapshot()
+        return True
 
-    def _close_position(self, order_id: str, exit_price: float, outcome: str) -> None:
+    def _close_position(self, order_id: str, exit_price: float, outcome: str) -> bool:
         """Close remaining qty, compute final P&L, write to journal."""
         with self._lock:
             order = self._orders.get(order_id)
             if order is None or order.status == "CLOSED":
-                return
+                return False
 
             gross = self._calc_gross(order.side, order.fill_price, exit_price, order.qty_open)
-            net = gross - (self._cost_per_order * 2)
+            net = gross - self._cost_per_order
             order.pnl_gross_realised += gross
             order.pnl_realised += net
             order.qty_open = 0
@@ -255,6 +296,31 @@ class PaperEngine:
             f"PaperEngine: {order_id} {outcome} @ {exit_price:.2f} "
             f"net_pnl={order.pnl_realised:.2f}"
         )
+        return True
+
+    def square_off_all(self, current_prices: Dict[str, float]) -> None:
+        """Close all ACTIVE/PARTIAL positions at the provided market prices."""
+        with self._lock:
+            active_ids = [
+                oid for oid, o in self._orders.items()
+                if o.status in ("ACTIVE", "PARTIAL")
+            ]
+        
+        if not active_ids:
+            return
+
+        logger.warning(f"PaperEngine: Squaring off {len(active_ids)} positions at market close.")
+        for oid in active_ids:
+            with self._lock:
+                symbol = self._orders[oid].symbol
+            
+            price = current_prices.get(symbol)
+            if price is None:
+                # If no price provided, use the last known entry or mid price
+                with self._lock:
+                    price = self._orders[oid].fill_price
+            
+            self._close_position(oid, price, "EOD_SQUAREOFF")
 
     # ------------------------------------------------------------------
     # Stats
@@ -381,7 +447,7 @@ class PaperEngine:
     def _write_active_snapshot(self) -> None:
         os.makedirs(os.path.dirname(self._active_orders_path) or ".", exist_ok=True)
         rows = self._active_snapshot_rows()
-        tmp_path = f"{self._active_orders_path}.tmp"
+        tmp_path = f"{self._active_orders_path}.{uuid.uuid4().hex}.tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(rows, f, indent=2)
@@ -424,7 +490,7 @@ class PaperEngine:
                 elif len(row) == len(fields):
                     repaired.append(row)
 
-            tmp_path = f"{self._journal_path}.tmp"
+            tmp_path = f"{self._journal_path}.{uuid.uuid4().hex}.tmp"
             with open(tmp_path, "w", newline="") as f:
                 csv.writer(f).writerows(repaired)
             os.replace(tmp_path, self._journal_path)
