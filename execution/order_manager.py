@@ -334,9 +334,16 @@ class OrderManager:
             exit_price = update.get("price")
             logger.info(f"Exit update {outcome} for {order_id}. Trade closed.")
             self._log_to_journal(trade, exit_price, outcome)
+            # Calculate pnl_r for RiskEngine circuit breakers (Module 3 fix)
+            pnl_inr = self._calculate_pnl(trade, exit_price)
+            risk_amount = self.config.get("capital", {}).get("equity_total", 50000) * \
+                          self.config.get("capital", {}).get("risk_per_trade_pct", 1.0) / 100
+            pnl_r = pnl_inr / risk_amount if risk_amount > 0 else 0
+
             await self.risk_engine.update_stats(
                 trade.get("domain", self._domain_for_symbol(trade["symbol"])),
-                pnl_inr=self._calculate_pnl(trade, exit_price),
+                pnl_r=pnl_r,
+                pnl_inr=pnl_inr,
                 trade_delta=-1,
             )
             del active[order_id]

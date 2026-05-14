@@ -64,14 +64,14 @@ class Preflight:
     def fail(self, name: str, detail: str) -> None:
         self.results.append(Check(name, "FAIL", detail))
 
-    def run(self, skip_redis: bool, run_tests: bool) -> int:
+    def run(self, skip_redis: bool, run_tests: bool, approve_live: bool = False) -> int:
         os.chdir(ROOT)
         self.check_structure()
         self.check_python_syntax()
         self.check_requirements()
         self.check_critical_imports()
         self.check_config()
-        self.check_live_safety()
+        self.check_live_safety(approve_live)
         self.check_logs_and_dashboard_data()
         self.check_trade_journal_math()
         self.check_active_order_state()
@@ -215,11 +215,14 @@ class Preflight:
         else:
             self.ok("Risk config", "Daily loss and per-trade risk controls are configured.")
 
-    def check_live_safety(self) -> None:
+    def check_live_safety(self, approve_live: bool = False) -> None:
         mode = os.environ.get("TRADING_MODE", "paper").strip().lower()
         paper_mode = bool(self.config.get("paper_mode", True))
         if mode == "live" and not paper_mode:
-            self.fail("Trading mode safety", "LIVE mode is active. Preflight refuses to approve live trading.")
+            if approve_live:
+                self.warn("Trading mode safety", "LIVE MODE APPROVED explicitly via --approve-live. Real money at risk.")
+            else:
+                self.fail("Trading mode safety", "Live mode active. Add --approve-live flag to override preflight block.")
         elif not paper_mode:
             self.fail("Trading mode safety", "config.paper_mode is false without approved live mode.")
         else:
@@ -292,8 +295,13 @@ class Preflight:
                 continue
 
             side = str(row.get("side", "")).upper()
+            outcome = str(row.get("outcome", "")).upper()
             expected_gross = (exit_price - entry) * qty if side == "BUY" else (entry - exit_price) * qty
-            expected_net = expected_gross - (cost_per_order * 2)
+            
+            # T1+T2 trades have 3 legs (Entry + T1 partial + T2/SL final)
+            legs = 3 if "T1" in outcome else 2
+            expected_net = expected_gross - (cost_per_order * legs)
+            
             if abs(pnl - expected_gross) > 0.05 or abs(net - expected_net) > 0.05:
                 bad.append(
                     f"row {i} {row.get('symbol')} {side}: expected gross={expected_gross:.2f}, "
@@ -357,10 +365,11 @@ class Preflight:
         """Sync missing morning data, then check if warm-up files are ready."""
         print("       (Live Sync) Fetching missing morning candles...")
         try:
-            # Call our new sync utility
-            subprocess.run([sys.executable, "-B", "pipeline/data_sync.py"], check=False, capture_output=True)
+            # Module 4 optimization: import and call directly instead of spawning subprocess
+            from pipeline.data_sync import sync_morning_data
+            sync_morning_data()
         except Exception as exc:
-            self.warn("Historical warm-up", f"Live sync script failed: {exc}")
+            self.warn("Historical warm-up", f"Live sync failed: {exc}")
 
         instruments = self.config.get("instruments", {})
         symbols = instruments.get("equity", []) + instruments.get("currency", [])
@@ -496,8 +505,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Validate the trading bot before startup.")
     parser.add_argument("--skip-redis", action="store_true", help="Do not require Redis connectivity.")
     parser.add_argument("--run-tests", action="store_true", help="Run the full unittest suite too.")
+    parser.add_argument("--approve-live", action="store_true", help="Explicitly approve live trading mode (use with extreme caution).")
     args = parser.parse_args()
-    return Preflight().run(skip_redis=args.skip_redis, run_tests=args.run_tests)
+    return Preflight().run(skip_redis=args.skip_redis, run_tests=args.run_tests, approve_live=args.approve_live)
 
 
 if __name__ == "__main__":

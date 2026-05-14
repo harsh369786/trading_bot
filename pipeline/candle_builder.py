@@ -152,10 +152,22 @@ class CandleBuilder:
         closed_time = closed_ts.time()
         return market_open <= closed_time < market_close
 
+    def on_tick(self, symbol: str, tick: dict):
+        """Process a live tick and update the current minute's candle."""
+        logger.debug(f"CandleBuilder: Received tick for {symbol} | ltp={tick.get('ltp')}")
+        self.tick_data[symbol].append(tick)
+
     async def _process_ticks_to_candles(self, symbol: str, ticks: List[dict]):
         """Aggregate ticks into OHLCV candles across multiple timeframes."""
         if not ticks:
             return
+            
+        logger.debug(f"CandleBuilder: Processing {len(ticks)} ticks for {symbol}")
+        
+        # Keep track of recent ticks for real-time OHLC estimation if needed
+        self.tick_data[symbol].extend(ticks)
+        if len(self.tick_data[symbol]) > 100:
+            self.tick_data[symbol] = self.tick_data[symbol][-100:]
 
         df_ticks = pd.DataFrame([t.get("data", {}) for t in ticks])
         required = {"timestamp", "ltp", "volume"}

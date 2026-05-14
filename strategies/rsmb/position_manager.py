@@ -45,9 +45,6 @@ class RSMBPosition:
     # Current trailing stop (updated each bar)
     trailing_sl: float = 0.0
 
-    # P&L
-    pnl_realised: float = 0.0
-
     # Status
     status: str = "PENDING"   # PENDING → ACTIVE → PARTIAL → CLOSED
 
@@ -76,12 +73,7 @@ class RSMBPositionManager:
 
     def can_open(self) -> bool:
         """True if fewer than MAX_OPEN_TRADES are currently open."""
-        with self._lock:
-            active = sum(
-                1 for p in self._positions.values()
-                if p.status in ("PENDING", "ACTIVE", "PARTIAL")
-            )
-        return active < self.MAX_OPEN_TRADES
+        return self.open_count() < self.MAX_OPEN_TRADES
 
     def open_position(self, signal: Signal) -> Optional[str]:
         """
@@ -187,11 +179,8 @@ class RSMBPositionManager:
             multiplier = 1  # equity shares — cost per order is flat
 
             if event == "T1_HIT":
-                # Book 50% qty
+                # Book 50% qty (Module 2 fix: P&L handled by paper_engine)
                 t1_qty = max(1, pos.qty_open // 2)
-                gross = self._calc_gross(pos.signal.side, entry, exit_price, t1_qty)
-                net = gross - (self._cost_per_order * 2)
-                pos.pnl_realised += net
                 pos.qty_open -= t1_qty
                 pos.qty_t1_booked = t1_qty
                 pos.sl_moved_to_breakeven = True
@@ -203,14 +192,11 @@ class RSMBPositionManager:
                 )
 
             elif event in ("T2_HIT", "SL_HIT"):
-                gross = self._calc_gross(pos.signal.side, entry, exit_price, pos.qty_open)
-                net = gross - (self._cost_per_order * 2)
-                pos.pnl_realised += net
+                # Module 2 fix: P&L handled by paper_engine
                 pos.qty_open = 0
                 pos.status = "CLOSED"
                 logger.info(
-                    f"RSMBPositionManager: {pos_id} {event} @ {exit_price:.2f} "
-                    f"net_pnl={pos.pnl_realised:.2f}"
+                    f"RSMBPositionManager: {pos_id} {event} @ {exit_price:.2f}"
                 )
 
     def update_trailing_stop(
@@ -285,40 +271,10 @@ class RSMBPositionManager:
     def get_stats(self) -> dict:
         """Return performance stats for the RSMB strategy."""
         with self._lock:
-            closed = [p for p in self._positions.values() if p.status == "CLOSED"]
-
-        if not closed:
-            return {
-                "net_pnl": 0.0,
-                "win_rate": 0.0,
-                "profit_factor": 0.0,
-                "total_trades": 0,
-                "open_trades": self.open_count(),
-            }
-
-        pnls = [p.pnl_realised for p in closed]
-        wins = [p for p in pnls if p > 0]
-        losses = [p for p in pnls if p <= 0]
-
-        gross_wins = sum(wins)
-        gross_losses = abs(sum(losses))
-        profit_factor = gross_wins / gross_losses if gross_losses > 0 else float("inf")
+            closed_count = sum(1 for p in self._positions.values() if p.status == "CLOSED")
 
         return {
-            "net_pnl": sum(pnls),
-            "win_rate": len(wins) / len(pnls) * 100 if pnls else 0.0,
-            "profit_factor": profit_factor,
-            "total_trades": len(closed),
+            "total_trades": closed_count,
             "open_trades": self.open_count(),
-            "expectancy": sum(pnls) / len(pnls) if pnls else 0.0,
+            "note": "Detailed P&L handled by PaperEngine"
         }
-
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _calc_gross(side: str, entry: float, exit_price: float, qty: int) -> float:
-        if side == "BUY":
-            return (exit_price - entry) * qty
-        return (entry - exit_price) * qty

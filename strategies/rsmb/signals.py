@@ -307,6 +307,8 @@ def evaluate_sell_signal(
 
     close = ind.get("close")
     vwap = ind.get("vwap")
+    ema21 = ind.get("ema21")
+    volume_ratio = ind.get("volume_ratio")
     daily_close = ind.get("daily_close")
     daily_ema50 = ind.get("daily_ema50")
     atr14 = ind.get("atr14")
@@ -314,6 +316,14 @@ def evaluate_sell_signal(
     # --- Condition 1: close < VWAP ---
     if close is None or vwap is None or close >= vwap:
         return _rejected(symbol, "SELL", rs_rank, f"close_above_vwap:{close}:{vwap}")
+
+    # --- Condition 2: close < EMA21 (Bearish Momentum) ---
+    if ema21 is None or close >= ema21:
+        return _rejected(symbol, "SELL", rs_rank, f"close_above_ema21:{close}:{ema21}")
+
+    # --- Condition 5: Volume Confirmation ---
+    if volume_ratio is None or volume_ratio <= 1.5:
+        return _rejected(symbol, "SELL", rs_rank, f"volume_ratio_low:{volume_ratio}")
 
     # --- Condition 3: daily_close < daily EMA 50 ---
     if daily_close is None or daily_ema50 is None or daily_close >= daily_ema50:
@@ -370,5 +380,5 @@ def _rejected(
     Log a rejection and return None.
     Returns None so callers can do: return _rejected(...).
     """
-    logger.debug(f"RSMB {side} {symbol}: REJECTED — {reason}")
+    logger.debug(f"RSMB {side} {symbol}: REJECTED [{reason}] rs={rs_rank:.3f}")
     return None

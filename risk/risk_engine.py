@@ -43,6 +43,24 @@ class RiskEngine:
         if not self.redis: return
         await self.redis.set(f"{self.KEY_PREFIX}{self.today}:{key}", val, ex=86400) # Expire in 24h
 
+    async def _get_stats_batch(self, *keys: str) -> list[float]:
+        """Fetch multiple stats in a single Redis round-trip (pipelined)."""
+        if not self.redis:
+            return [0.0] * len(keys)
+        
+        pipe = self.redis.pipeline()
+        for k in keys:
+            pipe.get(f"{self.KEY_PREFIX}{self.today}:{k}")
+        
+        results = await pipe.execute()
+        final = []
+        for v in results:
+            try:
+                final.append(float(v) if v is not None else 0.0)
+            except (TypeError, ValueError):
+                final.append(0.0)
+        return final
+
     def get_equity_position_size(self, entry: float, sl: float) -> int:
         """Calculate quantity based on fixed fractional risk."""
         risk_amount = self.capital_equity * self.risk_pct
@@ -53,18 +71,18 @@ class RiskEngine:
         return quantity
 
     def get_currency_lots(self, sl_paise: float) -> int:
-        """Calculate lots for currency based on fixed INR risk (Module 5)."""
-        risk_amount_inr = 500 
+        """Calculate lots for currency based on configured risk (Module 5 fix)."""
+        risk_amount_inr = self.capital_currency * self.risk_pct
         if sl_paise == 0: return 0
         
+        # sl_paise * 10 = INR impact per lot (tick size 0.0025, lot size 1000)
         lots = math.floor(risk_amount_inr / (sl_paise * 10))
         return max(1, min(lots, 3))
 
     async def check_circuit_breakers(self, domain: str) -> bool:
         """Verify if trading is allowed based on daily limits (Persisted in Redis)."""
         if domain == "equity":
-            loss_r = await self._get_stat("equity_loss_r")
-            open_count = await self._get_stat("equity_open_count")
+            loss_r, open_count = await self._get_stats_batch("equity_loss_r", "equity_open_count")
             
             if loss_r >= self.daily_loss_limit_r:
                 logger.warning(f"Equity daily loss limit ({self.daily_loss_limit_r}R) hit. Current: {loss_r}R")
@@ -74,8 +92,7 @@ class RiskEngine:
                 return False
         
         if domain == "currency":
-            loss_inr = await self._get_stat("currency_loss_inr")
-            open_count = await self._get_stat("currency_open_count")
+            loss_inr, open_count = await self._get_stats_batch("currency_loss_inr", "currency_open_count")
             
             if loss_inr >= self.currency_max_daily_loss_inr:
                 logger.warning(f"Currency daily loss limit (Rs {self.currency_max_daily_loss_inr}) hit. Current: Rs {loss_inr}")
@@ -89,16 +106,14 @@ class RiskEngine:
     async def update_stats(self, domain: str, pnl_r: float = 0, pnl_inr: float = 0, trade_delta: int = 0):
         """Update stats in Redis after trade execution/closure."""
         if domain == "equity":
-            curr_r = await self._get_stat("equity_loss_r")
-            curr_open = await self._get_stat("equity_open_count")
+            curr_r, curr_open = await self._get_stats_batch("equity_loss_r", "equity_open_count")
             # We only track losses in R (negative pnl_r)
             if pnl_r < 0:
                 await self._set_stat("equity_loss_r", curr_r + abs(pnl_r))
             await self._set_stat("equity_open_count", max(0, curr_open + trade_delta))
             
         if domain == "currency":
-            curr_inr = await self._get_stat("currency_loss_inr")
-            curr_open = await self._get_stat("currency_open_count")
+            curr_inr, curr_open = await self._get_stats_batch("currency_loss_inr", "currency_open_count")
             if pnl_inr < 0:
                 await self._set_stat("currency_loss_inr", curr_inr + abs(pnl_inr))
             await self._set_stat("currency_open_count", max(0, curr_open + trade_delta))
