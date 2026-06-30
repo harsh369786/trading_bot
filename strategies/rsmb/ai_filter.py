@@ -9,8 +9,9 @@ Spec compliance:
 - If model file missing or corrupted: log WARNING, return score=0.5 (do NOT block)
 - Prediction returns float probability of class=1 (profitable trade)
 - Retrain: only on Sunday 06:00 IST or manual trigger — NEVER intraday
-- Features: [rsi_14, macd_hist, atr_pct, volume_ratio, rs_rank, vwap_dist_pct,
-             ema21_dist_pct, adx_14, bb_width, hour_of_day, day_of_week]
+- Features: stationary price-distance features plus normalized indicators:
+  [dist_ema_9, dist_ema_21, dist_ema_50, rsi_14, atr_pct, dist_vwap,
+   ADX_14, DMP_14, DMN_14, bb_pct, rs_rank]
 """
 from __future__ import annotations
 
@@ -40,18 +41,10 @@ MODEL_PATH = Path("models/rsmb_xgb.pkl")
 FALLBACK_SCORE = 0.5
 
 FEATURE_COLS = [
-    "rsi_14",
-    "macd_hist",
-    "atr_pct",
-    "volume_ratio",
-    "rs_rank",
-    "vwap_dist_pct",
-    "ema21_dist_pct",
-    "adx_14",
-    "bb_width",
-    "hour_of_day",
-    "day_of_week",
+    "dist_ema_9", "dist_ema_21", "dist_ema_50", "rsi_14", "atr_pct",
+    "dist_vwap", "ADX_14", "DMP_14", "DMN_14", "bb_pct", "rs_rank",
 ]
+
 
 
 # ---------------------------------------------------------------------------
@@ -149,63 +142,42 @@ class RSMBAIFilter:
     def extract_features(
         bar: pd.Series,
         rs_rank: float,
-        vwap: float,
-        ema21: float,
-        atr: float,
-        volume_ratio: float,
-        adx: float,
-        bb_upper: float,
-        bb_lower: float,
+        **_,
     ) -> dict[str, float]:
+        """Build stationary feature dict from a completed 15m bar.
+
+        Extra keyword arguments are accepted for compatibility with older training
+        scripts, but the model feature contract is derived from the bar itself.
         """
-        Build the feature dict from a completed 15m bar and pre-computed indicators.
+        def safe_float(value, default: float = 0.0) -> float:
+            try:
+                parsed = float(value)
+                if np.isnan(parsed) or np.isinf(parsed):
+                    return default
+                return parsed
+            except (TypeError, ValueError):
+                return default
 
-        Parameters
-        ----------
-        bar          : Last completed 15m bar (pd.Series with close, rsi_14, macd_hist, etc.)
-        rs_rank      : Pre-computed RS_Rank (float, may be NaN)
-        vwap         : Session VWAP at bar close
-        ema21        : EMA 21 value at bar close
-        atr          : ATR 14 value at bar close
-        volume_ratio : volume / mean(last 5 bars volume)
-        adx          : ADX 14 at bar close
-        bb_upper     : Bollinger Band upper
-        bb_lower     : Bollinger Band lower
+        close = safe_float(bar.get("close"), 0.0)
+        vwap = safe_float(bar.get("vwap"), close)
+        lower = safe_float(bar.get("BBL_20_2.0"), close)
+        upper = safe_float(bar.get("BBU_20_2.0"), close)
+        bb_width = upper - lower
 
-        Returns
-        -------
-        dict[str, float] — feature dict matching FEATURE_COLS.
-        """
-        close = float(bar.get("close", 0.0))
-        bb_width = (
-            (bb_upper - bb_lower) / close if close != 0 else 0.0
-        )
-        vwap_dist_pct = (
-            (close - vwap) / vwap * 100 if vwap != 0 else 0.0
-        )
-        ema21_dist_pct = (
-            (close - ema21) / ema21 * 100 if ema21 != 0 else 0.0
-        )
-        atr_pct = (atr / close * 100) if close != 0 else 0.0
-
-        # Timestamp-based features
-        ts = bar.name if isinstance(bar.name, pd.Timestamp) else pd.Timestamp.now(tz="Asia/Kolkata")
-        hour_of_day = float(ts.hour + ts.minute / 60.0)
-        day_of_week = float(ts.dayofweek)  # 0=Mon, 4=Fri
-
-        return {
-            "rsi_14": float(bar.get("rsi_14", 50.0)),
-            "macd_hist": float(bar.get("macd_hist", 0.0)),
-            "atr_pct": atr_pct,
-            "volume_ratio": volume_ratio if not np.isnan(volume_ratio) else 1.0,
-            "rs_rank": rs_rank if not np.isnan(rs_rank) else 1.0,
-            "vwap_dist_pct": vwap_dist_pct,
-            "ema21_dist_pct": ema21_dist_pct,
-            "adx_14": adx,
-            "bb_width": bb_width,
-            "hour_of_day": hour_of_day,
-            "day_of_week": day_of_week,
+        features = {
+            "dist_ema_9": safe_float(bar.get("dist_ema_9"), (close - safe_float(bar.get("ema_9"), close)) / close if close else 0.0),
+            "dist_ema_21": safe_float(bar.get("dist_ema_21"), (close - safe_float(bar.get("ema_21"), close)) / close if close else 0.0),
+            "dist_ema_50": safe_float(bar.get("dist_ema_50"), (close - safe_float(bar.get("ema_50"), close)) / close if close else 0.0),
+            "rsi_14": safe_float(bar.get("rsi_14"), 50.0),
+            "atr_pct": safe_float(bar.get("atr_pct"), safe_float(bar.get("atr_14"), 0.0) / close if close else 0.0),
+            "dist_vwap": safe_float(bar.get("dist_vwap"), (close - vwap) / vwap if vwap else 0.0),
+            "ADX_14": safe_float(bar.get("ADX_14"), 0.0),
+            "DMP_14": safe_float(bar.get("DMP_14"), 0.0),
+            "DMN_14": safe_float(bar.get("DMN_14"), 0.0),
+            "bb_pct": safe_float(bar.get("bb_pct"), (close - lower) / bb_width if bb_width else 0.5),
+            "rs_rank": safe_float(rs_rank, 1.0),
         }
+        return features
 
     # ------------------------------------------------------------------
     # Training (Sunday 06:00 IST only — scheduler calls this)

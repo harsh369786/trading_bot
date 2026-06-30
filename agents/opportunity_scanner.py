@@ -12,14 +12,14 @@ class OpportunityScanner:
     def __init__(self, config: dict):
         self.config = config
         sig_cfg = config.get("currency_signal", {})
-        self.min_conditions = sig_cfg.get("conditions_required", 3)
-        self.min_adx = sig_cfg.get("min_adx", 13)
-        self.min_vol_ratio = sig_cfg.get("min_volume_ratio", 0.7)
+        self.min_conditions = max(1, min(int(sig_cfg.get("conditions_required", 3)), 6))
+        self.min_adx = sig_cfg.get("min_adx", 12)
+        self.min_vol_ratio = sig_cfg.get("min_volume_ratio", 0.5)
 
     def scan(self, row: pd.Series) -> tuple[str, str]:
         """Returns ('BUY'/'SELL'/'NONE', 'StrategyName')."""
         adx = row.get("ADX_14", 0)
-        mode = "TrendFollowing" if adx > 20 else "MeanReversion"
+        mode = "TrendFollowing" if adx > self.min_adx else "MeanReversion"
         
         buy_score = self._calculate_score(row, "BUY")
         sell_score = self._calculate_score(row, "SELL")
@@ -31,23 +31,23 @@ class OpportunityScanner:
         return "NONE", "None"
 
     def _calculate_score(self, row: pd.Series, side: str) -> int:
-        score = 0
+        score = 0.0
         try:
-            if row.get("ADX_14", 0) > 20:
+            if row.get("ADX_14", 0) > self.min_adx:
                 if side == "BUY":
-                    if row["ema_9"] > row["ema_21"] > row["ema_50"]:         score += 1
-                    if 45 <= row["rsi_14"] <= 70:                             score += 1
-                    if row.get("SUPERTd_10_3.0", 0) == 1:                    score += 1
-                    if row["close"] > row["vwap"]:                            score += 1
-                    if row["ADX_14"] > self.min_adx:                          score += 1
-                    if row.get("rel_vol", 0) > self.min_vol_ratio:            score += 1
+                    if row["ema_9"] > row["ema_21"] > row["ema_50"]:         score += 1.0
+                    if 45 <= row["rsi_14"] <= 70:                             score += 1.25
+                    if row.get("SUPERTd_10_3.0", 0) == 1:                    score += 0.75
+                    if row["close"] > row["vwap"]:                            score += 1.25
+                    if row["ADX_14"] > self.min_adx:                          score += 1.0
+                    if row.get("rel_vol", 1.0) > self.min_vol_ratio:          score += 0.75
                 else:  # SELL
-                    if row["ema_9"] < row["ema_21"] < row["ema_50"]:         score += 1
-                    if 30 <= row["rsi_14"] <= 55:                             score += 1
-                    if row.get("SUPERTd_10_3.0", 0) == -1:                   score += 1
-                    if row["close"] < row["vwap"]:                            score += 1
-                    if row["ADX_14"] > self.min_adx:                          score += 1
-                    if row.get("rel_vol", 0) > self.min_vol_ratio:            score += 1
+                    if row["ema_9"] < row["ema_21"] < row["ema_50"]:         score += 1.0
+                    if 30 <= row["rsi_14"] <= 55:                             score += 1.25
+                    if row.get("SUPERTd_10_3.0", 0) == -1:                   score += 0.75
+                    if row["close"] < row["vwap"]:                            score += 1.25
+                    if row["ADX_14"] > self.min_adx:                          score += 1.0
+                    if row.get("rel_vol", 1.0) > self.min_vol_ratio:          score += 0.75
             else:
                 # Mean Reversion Logic (Ranging Market)
                 # Weighted heavier to meet the conditions_required=4 threshold
@@ -59,11 +59,11 @@ class OpportunityScanner:
                     if row.get("close", 0) >= row.get("BBU_20_2.0", 0):          score += 2
         except KeyError as e:
             logger.warning(f"Scanner: Missing feature {e}")
-        return score
+        return int(round(score))
 
     def debug_score(self, row: pd.Series) -> dict:
         """Return per-condition breakdown for logging/dashboard debug."""
-        if row.get("ADX_14", 0) > 20:
+        if row.get("ADX_14", 0) > self.min_adx:
             labels = ["trend", "rsi_range", "supertrend", "vwap_side", "adx", "rel_vol"]
             buy_vals = [
                 row.get("ema_9", 0) > row.get("ema_21", 0) > row.get("ema_50", 0),

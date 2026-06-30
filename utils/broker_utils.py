@@ -12,11 +12,14 @@ class AngelOneMaster:
     URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
     CACHE_FILE = "data/master_contract.json"
     _is_downloading = False
+    _master_df = None
     EXCHANGE_ALIASES = {
         "CDE_FO": "CDS",
         "CDS": "CDS",
         "NSE": "NSE",
         "NFO": "NFO",
+        "BSE": "BSE",
+        "BFO": "BFO",
     }
     SYMBOL_ALIASES = {
         # Tata Motors changed symbol after the 2025 demerger/name change.
@@ -40,6 +43,7 @@ class AngelOneMaster:
             if response.status_code == 200:
                 with open(cls.CACHE_FILE, "wb") as f:
                     f.write(response.content)
+                cls._master_df = None
                 logger.success("✅ Master Contract updated.")
                 return True
         except Exception as e:
@@ -68,7 +72,9 @@ class AngelOneMaster:
             if not os.path.exists(cls.CACHE_FILE):
                 return None, None, None
             
-            df = pd.read_json(cls.CACHE_FILE)
+            if cls._master_df is None:
+                cls._master_df = pd.read_json(cls.CACHE_FILE)
+            df = cls._master_df.copy()
             exchange = cls.EXCHANGE_ALIASES.get(str(exchange).upper(), str(exchange).upper())
             requested_symbol = str(symbol).upper()
             symbol = cls.SYMBOL_ALIASES.get(requested_symbol, requested_symbol)

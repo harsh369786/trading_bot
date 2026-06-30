@@ -77,6 +77,7 @@ class RSMBStrategy(BaseStrategy):
         self._equity_total = capital_cfg.get("equity_total", 50000)
         self._risk_pct = capital_cfg.get("risk_per_trade_pct", 1.0)
         self._risk_capital = self._equity_total * self._risk_pct / 100
+        self._max_notional = float(capital_cfg.get("max_equity_notional_per_trade", self._equity_total))
 
         logger.info(
             f"RSMBStrategy: initialized | universe={len(RSMB_UNIVERSE)} symbols | "
@@ -154,6 +155,7 @@ class RSMBStrategy(BaseStrategy):
             ai_score=ai_score,
             vix_veto=vix_veto,
             risk_capital=self._risk_capital,
+            max_notional=self._max_notional,
         )
 
         if signal is None:
@@ -166,6 +168,7 @@ class RSMBStrategy(BaseStrategy):
                 ai_score=ai_score,
                 vix_veto=vix_veto,
                 risk_capital=self._risk_capital,
+                max_notional=self._max_notional,
             )
 
         # Check capacity
@@ -200,6 +203,11 @@ class RSMBStrategy(BaseStrategy):
         if signal.id:
             ts = pd.Timestamp.now(tz="Asia/Kolkata")
             self._position_manager.on_fill(signal.id, fill_price, ts)
+
+    def cancel_pending(self, signal: Signal) -> None:
+        """Release a reserved RSMB position when downstream execution is blocked."""
+        if signal.id:
+            self._position_manager.cancel_pending(signal.id)
 
     def on_target_hit(self, signal: Signal, target_num: int) -> None:
         logger.info(f"RSMBStrategy: {signal.symbol} target {target_num} hit")
@@ -259,31 +267,9 @@ class RSMBStrategy(BaseStrategy):
         """Extract features and call AI filter."""
         try:
             bar = df_15m.iloc[-1]
-            vwap_s = compute_vwap(df_15m)
-            ema21_s = compute_ema(df_15m["close"], 21)
-            atr_s = compute_atr(df_15m, 14)
-            vol_ratio_s = compute_volume_ratio(df_15m["volume"], 5)
-
-            vwap = float(vwap_s.iloc[-1]) if not vwap_s.empty else 0.0
-            ema21 = float(ema21_s.iloc[-1]) if not ema21_s.empty else 0.0
-            atr = float(atr_s.iloc[-1]) if not atr_s.empty else 0.0
-            vol_ratio = float(vol_ratio_s.iloc[-1]) if not vol_ratio_s.empty else 1.0
-
-            # Bollinger and ADX for features (Module 1 optimization)
-            bb_upper = float(df_15m["BBU_20_2.0"].iloc[-1]) if "BBU_20_2.0" in df_15m.columns else 0.0
-            bb_lower = float(df_15m["BBL_20_2.0"].iloc[-1]) if "BBL_20_2.0" in df_15m.columns else 0.0
-            adx = float(df_15m["ADX_14"].iloc[-1]) if "ADX_14" in df_15m.columns else 0.0
-
             features = RSMBAIFilter.extract_features(
                 bar=bar,
-                rs_rank=rs_rank if not math.isnan(rs_rank) else 1.0,
-                vwap=vwap,
-                ema21=ema21,
-                atr=atr,
-                volume_ratio=vol_ratio,
-                adx=adx,
-                bb_upper=bb_upper,
-                bb_lower=bb_lower,
+                rs_rank=(rs_rank if (rs_rank is not None and not math.isnan(float(rs_rank))) else 1.0),
             )
             return self._ai_filter.predict(features)
 

@@ -2,6 +2,8 @@ import pandas as pd
 import numpy as np
 from loguru import logger
 import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 class AccuracyAnalyzer:
     """
@@ -11,32 +13,38 @@ class AccuracyAnalyzer:
     def __init__(self, journal_path: str = "data/trade_journal.csv"):
         self.journal_path = journal_path
 
-    def _load_data(self) -> pd.DataFrame:
+    def _load_data(self, today_only: bool = False) -> pd.DataFrame:
         if not os.path.exists(self.journal_path):
             return pd.DataFrame()
-        return pd.read_csv(self.journal_path)
+        df = pd.read_csv(self.journal_path)
+        if today_only and not df.empty and "date" in df.columns:
+            dates = pd.to_datetime(df["date"], errors="coerce")
+            today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+            df = df.loc[dates.dt.date == today].copy()
+        return df
 
-    def get_stats(self) -> dict:
+    def get_stats(self, today_only: bool = False) -> dict:
         """Core high-level metrics for the dashboard and daily reports."""
-        df = self._load_data()
+        df = self._load_data(today_only=today_only)
         if df.empty: return {}
+        pnl_col = "pnl_after_costs" if "pnl_after_costs" in df.columns else "pnl_inr"
         
-        wins = df[df['pnl_inr'] > 0]
+        wins = df[df[pnl_col] > 0]
         total = len(df)
         win_rate = (len(wins) / total) * 100 if total > 0 else 0
         
         # Calculate Profit Factor
-        gross_profit = df[df['pnl_inr'] > 0]['pnl_inr'].sum()
-        gross_loss = abs(df[df['pnl_inr'] < 0]['pnl_inr'].sum())
+        gross_profit = df[df[pnl_col] > 0][pnl_col].sum()
+        gross_loss = abs(df[df[pnl_col] < 0][pnl_col].sum())
         profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
 
         return {
             "total_trades": total,
             "win_rate": f"{win_rate:.1f}%",
-            "avg_pnl": df['pnl_inr'].mean(),
+            "avg_pnl": df[pnl_col].mean(),
             "profit_factor": round(profit_factor, 2),
-            "net_pnl": df['pnl_inr'].sum(),
-            "max_drawdown": self.calculate_max_drawdown(df['pnl_inr'])
+            "net_pnl": df[pnl_col].sum(),
+            "max_drawdown": self.calculate_max_drawdown(df[pnl_col])
         }
 
     def get_detailed_breakdown(self) -> dict:

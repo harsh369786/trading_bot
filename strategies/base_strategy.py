@@ -27,6 +27,9 @@ class Signal:
     rejection_reason: Optional[str]
     timestamp: pd.Timestamp
     id: Optional[str] = None
+    expire_after_bars: int = 0
+    t1_exit_pct: float = 0.5
+    target2_mode: str = "price"  # "price" or "manual"
 
 
 class BaseStrategy(ABC):

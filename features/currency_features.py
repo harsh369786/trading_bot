@@ -36,7 +36,10 @@ class CurrencyFeatures:
             return pd.Series([False] * len(df))
             
         levels = ['pivot_p', 'pivot_r1', 'pivot_s1', 'pivot_r2', 'pivot_s2']
-        min_dist = df[levels].apply(lambda x: np.min(np.abs(x - df['close'])), axis=1)
-        
+        close_col = df['close']
+        min_dist = df[levels].apply(
+            lambda row: np.min(np.abs(row.values - close_col.loc[row.name])), axis=1
+        )
+
         # Proximity threshold: 3 paise (0.03)
         return min_dist < 0.03

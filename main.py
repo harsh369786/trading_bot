@@ -19,6 +19,8 @@ from tracking.trade_lifecycle_tracker import TradeLifecycleTracker
 
 # RSMB Strategy
 from strategies.rsmb.strategy import RSMBStrategy
+from strategies.gamma_scalper.strategy import GammaScalperStrategy
+from strategies.mean_reversion.strategy import MeanReversionStrategy
 from execution.paper_engine import PaperEngine
 from tracking.signal_logger import SignalLogger
 
@@ -73,23 +75,28 @@ async def main():
     equity_engine = EquitySignalEngine(config, risk_engine=risk_engine)
     currency_engine = CurrencyAgentPipeline(config)
     
-    ws_feed = WebSocketFeed(config)
+    ws_feed = WebSocketFeed(config, redis_queue=redis_queue)
     streamer = LivePriceStreamer(config, redis_queue)
 
     # --- RSMB: shared paper engine + strategy (independent of existing OrderManager) ---
     signal_logger = SignalLogger()
     paper_engine = PaperEngine(
-        cost_per_order_inr=config.get("execution", {}).get("cost_per_order_inr", 22.0)
+        cost_per_order_inr=config.get("execution", {}).get("cost_per_order_inr", 22.0),
+        config=config,
     )
     rsmb_strategy = RSMBStrategy(
         config=config,
         broker_client=getattr(equity_engine, '_broker', None),
         signal_logger=signal_logger,
     )
+    gamma_strategy = GammaScalperStrategy(config=config, signal_logger=signal_logger)
+    meanrev_strategy = MeanReversionStrategy(config=config, signal_logger=signal_logger)
 
     candles = CandleBuilder(
         config, equity_engine, currency_engine, order_manager, redis_queue,
         rsmb_strategy=rsmb_strategy,
+        gamma_strategy=gamma_strategy,
+        meanrev_strategy=meanrev_strategy,
         paper_engine=paper_engine,
     )
     
@@ -102,9 +109,25 @@ async def main():
         logger.warning(f"Found {len(active_positions)} open positions. Syncing with Redis...")
         # Logic to adopt or close unmanaged trades would go here
     await order_manager.reconcile_startup_state()
+    active_orders = await order_manager.get_active_orders()
+    equity_open = sum(
+        1 for trade in active_orders.values()
+        if trade.get("status") in {"PENDING", "PROTECTED"}
+        and trade.get("domain", order_manager._domain_for_symbol(trade.get("symbol", ""))) == "equity"
+    )
+    currency_open = sum(
+        1 for trade in active_orders.values()
+        if trade.get("status") in {"PENDING", "PROTECTED"}
+        and trade.get("domain", order_manager._domain_for_symbol(trade.get("symbol", ""))) == "currency"
+    )
+    paper_active = paper_engine.get_active_orders()
+    equity_open += sum(1 for order in paper_active if order.strategy not in {"gamma_scalper", "mean_reversion"})
+    gamma_open = sum(1 for order in paper_active if order.strategy == "gamma_scalper")
+    meanrev_open = sum(1 for order in paper_active if order.strategy == "mean_reversion")
+    await risk_engine.reconcile_open_counts(equity_open, currency_open, gamma_open, meanrev_open)
     
     analyzer = AccuracyAnalyzer()
-    learner = AdaptiveLearningEngine()
+    learner = AdaptiveLearningEngine(config=config)
     reporter = DailyReportPublisher(config)
 
     # 3. Execution (The Swarm)
@@ -116,16 +139,55 @@ async def main():
             try:
                 vix_raw = await redis_client.get("market:vix:latest")
                 if vix_raw:
-                    rsmb_strategy.update_vix(float(vix_raw))
+                    vix_value = float(vix_raw)
+                    rsmb_strategy.update_vix(vix_value)
+                    gamma_strategy.update_vix(vix_value)
             except Exception as exc:
                 logger.debug(f"VIX poll: {exc}")
             await asyncio.sleep(300)  # 5 minutes
+
+    def paper_domain_for_strategy(strategy_name: str) -> str:
+        if strategy_name == "gamma_scalper":
+            return "gamma"
+        if strategy_name == "mean_reversion":
+            return "mean_reversion"
+        return "equity"
+
+    def risk_amount_for_domain(domain: str) -> float:
+        capital_cfg = config.get("capital", {})
+        risk_pct = float(capital_cfg.get("risk_per_trade_pct", 1.0)) / 100.0
+        if domain == "gamma":
+            capital = float(capital_cfg.get("gamma_total", 30000))
+        elif domain == "mean_reversion":
+            capital = float(capital_cfg.get("meanrev_total", 40000))
+        else:
+            capital = float(capital_cfg.get("equity_total", 50000))
+        return max(capital * risk_pct, 1.0)
+
+    async def record_paper_engine_events(events):
+        """Record paper closes in shared RiskEngine counters."""
+        if not events:
+            return
+        for order_id, event in events:
+            if event == "T1_HIT":
+                continue
+            order = paper_engine.get_order_snapshot(order_id)
+            if order is None or order.status != "CLOSED":
+                continue
+            domain = paper_domain_for_strategy(order.strategy)
+            risk_amount = risk_amount_for_domain(domain)
+            pnl_inr = float(order.pnl_realised)
+            await risk_engine.update_stats(
+                domain,
+                pnl_r=pnl_inr / risk_amount,
+                pnl_inr=pnl_inr,
+                trade_delta=-1,
+            )
 
     async def market_monitor():
         """Monitor IST market close windows for EOD square-off."""
         equity_square_off_done = False
         currency_square_off_done = False
-
         async def latest_prices_for_open_paper_orders() -> dict:
             prices = {}
             try:
@@ -139,6 +201,11 @@ async def main():
                     raw = await redis_client.get(f"bot:ltp:{order.symbol}")
                     if raw is not None:
                         prices[order.symbol] = float(raw)
+                    else:
+                        logger.warning(
+                            f"EOD: No Redis LTP for paper {order.symbol}; "
+                            "PaperEngine will use fill_price fallback."
+                        )
                 except Exception as exc:
                     logger.warning(f"Could not read latest LTP for paper {order.symbol}: {exc}")
             return prices
@@ -150,7 +217,8 @@ async def main():
                 logger.warning("🏁 Market close approaching (15:20 IST). Squaring off all positions...")
                 # 1. Square off RSMB Paper Engine
                 latest_prices = await latest_prices_for_open_paper_orders()
-                paper_engine.square_off_all(latest_prices)
+                events = paper_engine.square_off_all(latest_prices)
+                await record_paper_engine_events(events)
                 # 2. Square off Existing Strategy OrderManager
                 await order_manager.square_off_all(domain="equity")
                 equity_square_off_done = True
@@ -193,15 +261,26 @@ async def main():
                 raw = await redis_client.get(f"bot:ltp:{order.symbol}")
                 if raw is not None:
                     final_prices[order.symbol] = float(raw)
+                else:
+                    logger.warning(
+                        f"Shutdown square-off: No Redis LTP for paper {order.symbol}; "
+                        "PaperEngine will use fill_price fallback."
+                    )
         except Exception as exc:
             logger.warning(f"Could not load final paper square-off prices: {exc}")
-        paper_engine.square_off_all(final_prices)
+        events = paper_engine.square_off_all(final_prices)
+        await record_paper_engine_events(events)
         await order_manager.square_off_all()
-        stats = analyzer.get_stats()
-        learner.tune_parameters(stats)
-        report = reporter.format_daily_summary(stats)
-        reporter.send_report(report)
+        now = datetime.now(IST)
+        if now.hour >= 17:
+            stats = analyzer.get_stats(today_only=True)
+            learner.tune_parameters(stats)
+        else:
+            logger.info("Skipping adaptive learning before EOD close window; shutdown was not nightly maintenance.")
+        await redis_queue.close()
         logger.info("Nightly maintenance complete. Goodbye.")
+        import os
+        os._exit(0)
 
 if __name__ == "__main__":
     asyncio.run(main())

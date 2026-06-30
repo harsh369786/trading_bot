@@ -43,8 +43,17 @@ def compute_vwap(df: pd.DataFrame) -> pd.Series:
         return pd.Series(np.nan, index=df.index)
 
     typical_price: pd.Series = (df["high"] + df["low"] + df["close"]) / 3
-    cumulative_tp_vol: pd.Series = (typical_price * df["volume"]).cumsum()
-    cumulative_vol: pd.Series = df["volume"].cumsum()
+    tp_vol = typical_price * df["volume"]
+
+    # VWAP must reset at each session start — use daily groupby cumsum
+    # so historical multi-day slices produce correct per-session VWAP values.
+    if hasattr(df.index, "date"):
+        date_groups = pd.Series(df.index.date, index=df.index)
+        cumulative_tp_vol = tp_vol.groupby(date_groups).cumsum()
+        cumulative_vol = df["volume"].groupby(date_groups).cumsum()
+    else:
+        cumulative_tp_vol = tp_vol.cumsum()
+        cumulative_vol = df["volume"].cumsum()
 
     # Avoid division by zero on zero-volume bars
     vwap = cumulative_tp_vol / cumulative_vol.replace(0, np.nan)

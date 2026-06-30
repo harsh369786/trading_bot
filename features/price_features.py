@@ -11,7 +11,8 @@ class PriceFeatures:
     @staticmethod
     def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         """Add EMA, VWAP, RSI, MACD, ATR, Supertrend, and ADX."""
-        if len(df) < 50:
+        df = df.copy()
+        if len(df) < 20:
             return df
             
         import ta
@@ -20,24 +21,24 @@ class PriceFeatures:
         from ta.volatility import AverageTrueRange, BollingerBands
         
         # EMA
-        df['ema_9'] = EMAIndicator(close=df['close'], window=9).ema_indicator()
-        df['ema_21'] = EMAIndicator(close=df['close'], window=21).ema_indicator()
-        df['ema_50'] = EMAIndicator(close=df['close'], window=50).ema_indicator()
+        df['ema_9'] = EMAIndicator(close=df['close'], window=9, fillna=True).ema_indicator()
+        df['ema_21'] = EMAIndicator(close=df['close'], window=21, fillna=True).ema_indicator()
+        df['ema_50'] = EMAIndicator(close=df['close'], window=50, fillna=True).ema_indicator()
         
         # Momentum
-        df['rsi_14'] = RSIIndicator(close=df['close'], window=14).rsi()
+        df['rsi_14'] = RSIIndicator(close=df['close'], window=14, fillna=True).rsi()
         
         # Trend Strength
-        adx_ind = ADXIndicator(high=df['high'], low=df['low'], close=df['close'], window=14)
+        adx_ind = ADXIndicator(high=df['high'], low=df['low'], close=df['close'], window=14, fillna=True)
         df['ADX_14'] = adx_ind.adx()
         df['DMP_14'] = adx_ind.adx_pos()
         df['DMN_14'] = adx_ind.adx_neg()
         
         # Volatility
-        df['atr_14'] = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14).average_true_range()
+        df['atr_14'] = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14, fillna=True).average_true_range()
         
         # Bollinger Bands
-        bb_ind = BollingerBands(close=df['close'], window=20, window_dev=2)
+        bb_ind = BollingerBands(close=df['close'], window=20, window_dev=2, fillna=True)
         df['BBL_20_2.0'] = bb_ind.bollinger_lband()
         df['BBM_20_2.0'] = bb_ind.bollinger_mavg()
         df['BBU_20_2.0'] = bb_ind.bollinger_hband()
@@ -52,7 +53,21 @@ class PriceFeatures:
         df['vwap'] = (cum_tpv / cum_volume.replace(0, np.nan)).fillna(df['close'])
         df.drop(['date', 'tp', 'tpv'], axis=1, inplace=True)
 
-        # True Supertrend Implementation (Vectorized/Numpy loop)
+        # Prefer pandas_ta's vectorized implementation; keep local fallback for environments without it.
+        try:
+            import pandas_ta as pta
+            st = pta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=3.0)
+            if st is not None and not st.empty:
+                supertrend_col = next((col for col in st.columns if col.startswith('SUPERT_')), None)
+                direction_col = next((col for col in st.columns if col.startswith('SUPERTd_')), None)
+                if supertrend_col and direction_col:
+                    df['SUPERT_10_3.0'] = st[supertrend_col].fillna(df['close'])
+                    df['SUPERTd_10_3.0'] = st[direction_col].fillna(1)
+                    return PriceFeatures.add_relative_price_features(df)
+        except Exception:
+            pass
+
+        # Local fallback when pandas_ta is unavailable.
         m = 3.0
         n = 10
         hl2 = (df['high'] + df['low']) / 2
@@ -97,7 +112,42 @@ class PriceFeatures:
                 st_dir[i] = st_dir[i-1]
                 
         df['SUPERTd_10_3.0'] = st_dir
+        df['SUPERT_10_3.0'] = np.where(st_dir == 1, final_lb, final_ub)
         
+        return PriceFeatures.add_relative_price_features(df)
+
+    @staticmethod
+    def add_relative_price_features(df: pd.DataFrame) -> pd.DataFrame:
+        """Add stationary price-distance features for ML models.
+
+        Absolute prices/EMAs/VWAP are kept for rule logic, but ML should consume
+        these normalized distances so models generalize across symbols and regimes.
+        """
+        df = df.copy()
+
+        def safe_div(numerator, denominator):
+            denom = pd.to_numeric(denominator, errors='coerce').replace(0, np.nan)
+            return (pd.to_numeric(numerator, errors='coerce') / denom).replace([np.inf, -np.inf], np.nan)
+
+        close = pd.to_numeric(df.get('close'), errors='coerce')
+        for span in (9, 21, 50):
+            col = f'ema_{span}'
+            if col in df.columns:
+                df[f'dist_ema_{span}'] = safe_div(close - pd.to_numeric(df[col], errors='coerce'), close)
+
+        if 'vwap' in df.columns:
+            vwap = pd.to_numeric(df['vwap'], errors='coerce')
+            df['dist_vwap'] = safe_div(close - vwap, vwap)
+
+        if 'atr_14' in df.columns:
+            df['atr_pct'] = safe_div(df['atr_14'], close)
+
+        if {'BBL_20_2.0', 'BBU_20_2.0'}.issubset(df.columns):
+            lower = pd.to_numeric(df['BBL_20_2.0'], errors='coerce')
+            upper = pd.to_numeric(df['BBU_20_2.0'], errors='coerce')
+            width = (upper - lower).replace(0, np.nan)
+            df['bb_pct'] = safe_div(close - lower, width).clip(lower=-2.0, upper=3.0)
+
         return df
 
     @staticmethod

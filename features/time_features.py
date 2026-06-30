@@ -12,6 +12,7 @@ class TimeFeatures:
 
     def add_session_flags(self, df: pd.DataFrame) -> pd.DataFrame:
         """Categorize signals based on time-of-day market character."""
+        df = df.copy()
         # Ensure index is datetime
         if not isinstance(df.index, pd.DatetimeIndex):
             df.index = pd.to_datetime(df.index)

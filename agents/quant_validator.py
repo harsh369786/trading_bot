@@ -50,16 +50,17 @@ class QuantValidator:
         if missing_features:
             return {"valid": False, "reason": f"Missing features for ML: {missing_features}"}
             
-        features = df_5m.iloc[-1][self.feature_cols].values.astype(float)
+        features = df_5m.tail(1)[self.feature_cols].astype(float)
         try:
-            probs = self.xgb.predict(features) # returns 1D array [neutral, buy, sell] because features is 1D
+            probs = self.xgb.predict(features)
+            if getattr(probs, "ndim", 1) == 2:
+                probs = probs[0]
             
             if side == "BUY":
                 confidence = probs[1]
-                threshold = self.config.get("currency_signal", {}).get("min_buy_confidence", 0.40)
             else:
                 confidence = probs[2]
-                threshold = self.config.get("currency_signal", {}).get("min_sell_confidence", 0.40)
+            threshold = float(self.config.get("currency_signal", {}).get("min_quant_score", 70)) / 100.0
                 
             quant_score = int(confidence * 100)
             

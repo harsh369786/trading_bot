@@ -14,6 +14,41 @@ class TradeLifecycleTracker:
         self.redis_queue = redis_queue
         self.symbols = config.get("instruments", {}).get("equity", []) + config.get("instruments", {}).get("currency", [])
 
+    async def _evaluate_price(self, symbol: str, price: float, my_trades: dict):
+        for oid, trade in list(my_trades.items()):
+            try:
+                side = trade["side"]
+                entry = float(trade["entry"])
+                sl = float(trade["sl"])
+                target_raw = trade.get("target") or trade.get("t1")
+                if target_raw is None:
+                    logger.error(f"Active trade {oid} has no target/t1 field: {trade}")
+                    continue
+                target = float(target_raw)
+            except (KeyError, TypeError, ValueError):
+                logger.error(f"Active trade {oid} has invalid SL/target fields: {trade}")
+                continue
+
+            if (side == "BUY" and price <= sl) or (side == "SELL" and price >= sl):
+                logger.warning(f"SL HIT for {symbol} at {price} (Entry: {entry}, SL: {sl})")
+                await self.order_manager.handle_order_update({
+                    "order_id": oid,
+                    "status": "SL_HIT",
+                    "price": price,
+                    "is_exit": True,
+                })
+                del my_trades[oid]
+
+            elif (side == "BUY" and price >= target) or (side == "SELL" and price <= target):
+                logger.success(f"TARGET HIT for {symbol} at {price} (Entry: {entry}, Target: {target})")
+                await self.order_manager.handle_order_update({
+                    "order_id": oid,
+                    "status": "TARGET_HIT",
+                    "price": price,
+                    "is_exit": True,
+                })
+                del my_trades[oid]
+
     async def _monitor_symbol(self, symbol: str):
         """Monitor ticks for a specific symbol if active trades exist."""
         last_id = "$"
@@ -36,6 +71,17 @@ class TradeLifecycleTracker:
                 await asyncio.sleep(0.5)
                 continue
 
+            redis_client = getattr(self.redis_queue, "client", None)
+            if redis_client is not None:
+                try:
+                    raw_ltp = await redis_client.get(f"bot:ltp:{symbol}")
+                    if raw_ltp is not None:
+                        await self._evaluate_price(symbol, float(raw_ltp), my_trades)
+                except (TypeError, ValueError) as exc:
+                    logger.warning(f"Skipping invalid latest LTP for {symbol}: {exc}")
+                except Exception as exc:
+                    logger.debug(f"Could not read latest LTP for {symbol}: {exc}")
+
             ticks, new_id = await self.redis_queue.read_ticks(symbol, last_id)
             for tick_wrapper in ticks:
                 tick = tick_wrapper.get("data", {})
@@ -45,39 +91,7 @@ class TradeLifecycleTracker:
                     logger.warning(f"Skipping malformed tick for {symbol}: {tick}")
                     continue
 
-                for oid, trade in list(my_trades.items()):
-                    try:
-                        side = trade["side"]
-                        entry = float(trade["entry"])
-                        sl = float(trade["sl"])
-                        target_raw = trade.get("target") or trade.get("t1")
-                        if target_raw is None:
-                            logger.error(f"Active trade {oid} has no target/t1 field: {trade}")
-                            continue
-                        target = float(target_raw)
-                    except (KeyError, TypeError, ValueError):
-                        logger.error(f"Active trade {oid} has invalid SL/target fields: {trade}")
-                        continue
-
-                    if (side == "BUY" and price <= sl) or (side == "SELL" and price >= sl):
-                        logger.warning(f"SL HIT for {symbol} at {price} (Entry: {entry}, SL: {sl})")
-                        await self.order_manager.handle_order_update({
-                            "order_id": oid,
-                            "status": "SL_HIT",
-                            "price": price,
-                            "is_exit": True,
-                        })
-                        del my_trades[oid]
-
-                    elif (side == "BUY" and price >= target) or (side == "SELL" and price <= target):
-                        logger.success(f"TARGET HIT for {symbol} at {price} (Entry: {entry}, Target: {target})")
-                        await self.order_manager.handle_order_update({
-                            "order_id": oid,
-                            "status": "TARGET_HIT",
-                            "price": price,
-                            "is_exit": True,
-                        })
-                        del my_trades[oid]
+                await self._evaluate_price(symbol, price, my_trades)
 
             last_id = new_id
             await asyncio.sleep(0.05)

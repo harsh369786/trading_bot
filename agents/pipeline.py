@@ -24,6 +24,11 @@ class CurrencyAgentPipeline:
         self.signal_logger = SignalLogger()
         self.max_signals = config.get("capital", {}).get("max_open_trades_currency", 2)
         self._last_signal_bar = {}  # symbol -> timestamp
+        paper_cfg = config.get("paper_trading", {})
+        self.paper_mode = bool(config.get("paper_mode", True))
+        self.paper_relaxed = self.paper_mode and bool(paper_cfg.get("relaxed_signals", False))
+        self.paper_currency_min_conditions = int(paper_cfg.get("currency_min_conditions", 3))
+        self.paper_bypass_quant = bool(paper_cfg.get("bypass_currency_quant", False))
 
     async def process_symbol(self, symbol: str, df_5m: pd.DataFrame, df_15m: pd.DataFrame):
         """Run one currency-pair evaluation from closed 5m and 15m candles."""
@@ -71,15 +76,32 @@ class CurrencyAgentPipeline:
                 status="NO_TRADE",
                 reason=f"Scanner: BUY={debug['buy_score']} SELL={debug['sell_score']} of {debug['min_needed']} needed",
             )
-            return None
+            relaxed_side = self._paper_relaxed_currency_side(debug)
+            if not relaxed_side:
+                return None
+            side = relaxed_side
+            strategy = f"{debug.get('mode', 'Scanner')}_PAPER_RELAXED"
+            logger.warning(
+                f"PAPER_RELAXED currency scanner: {symbol} {side} "
+                f"BUY={debug['buy_score']} SELL={debug['sell_score']} "
+                f"needed={debug['min_needed']}"
+            )
 
         logger.info(f"Swarm: {strategy} setup detected for {symbol} ({side})")
 
         validation = self.validator.validate(df_5m, df_15m, side)
         if not validation["valid"]:
-            logger.info(f"Swarm: signal rejected by QuantValidator: {validation['reason']}")
-            self.signal_logger.log_signal(symbol, side, strategy, last_row["close"], 0, 0, 0, "NO_TRADE", f"Quant: {validation['reason']}")
-            return None
+            if self.paper_relaxed and self.paper_bypass_quant:
+                logger.warning(f"PAPER_RELAXED currency quant bypass: {symbol} {side} | {validation['reason']}")
+                validation = {
+                    "valid": True,
+                    "reason": f"PAPER_RELAXED: {validation['reason']}",
+                    "quant_score": 50,
+                }
+            else:
+                logger.info(f"Swarm: signal rejected by QuantValidator: {validation['reason']}")
+                self.signal_logger.log_signal(symbol, side, strategy, last_row["close"], 0, 0, 0, "NO_TRADE", f"Quant: {validation['reason']}")
+                return None
 
         risk_params = self.risk_manager.calculate_risk_params(last_row.to_dict(), side)
         if risk_params["rr"] < 1.5:
@@ -122,6 +144,18 @@ class CurrencyAgentPipeline:
             self._last_signal_bar[symbol] = last_ts
         # Note: RiskEngine tracks open count in Redis; no local counter needed (C7 fix).
         return signal_data
+
+    def _paper_relaxed_currency_side(self, debug: dict) -> str | None:
+        if not self.paper_relaxed:
+            return None
+
+        buy_score = int(debug.get("buy_score", 0))
+        sell_score = int(debug.get("sell_score", 0))
+        if max(buy_score, sell_score) < self.paper_currency_min_conditions:
+            return None
+        if buy_score == sell_score:
+            return None
+        return "BUY" if buy_score > sell_score else "SELL"
 
     async def run(self):
         logger.info("Currency Agent Pipeline active.")

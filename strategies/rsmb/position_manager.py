@@ -119,6 +119,16 @@ class RSMBPositionManager:
             f"RSMBPositionManager: position {position_id} filled @ {fill_price:.2f}"
         )
 
+    def cancel_pending(self, position_id: str) -> None:
+        """Remove a reserved position that never reached paper execution."""
+        with self._lock:
+            pos = self._positions.get(position_id)
+            if pos is None:
+                return
+            if pos.status == "PENDING":
+                del self._positions[position_id]
+                logger.info(f"RSMBPositionManager: cancelled pending position {position_id}")
+
     # ------------------------------------------------------------------
     # Price updates — check SL, T1, T2
     # ------------------------------------------------------------------

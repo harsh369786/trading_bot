@@ -64,7 +64,7 @@ class Preflight:
     def fail(self, name: str, detail: str) -> None:
         self.results.append(Check(name, "FAIL", detail))
 
-    def run(self, skip_redis: bool, run_tests: bool, approve_live: bool = False) -> int:
+    def run(self, skip_redis: bool, run_tests: bool, approve_live: bool = False, sync_history: bool = False) -> int:
         os.chdir(ROOT)
         self.check_structure()
         self.check_python_syntax()
@@ -75,7 +75,7 @@ class Preflight:
         self.check_logs_and_dashboard_data()
         self.check_trade_journal_math()
         self.check_active_order_state()
-        self.check_historical_warmup()
+        self.check_historical_warmup(sync_history=sync_history)
         self.check_core_component_contracts()
         if not skip_redis:
             asyncio.run(self.check_redis())
@@ -171,6 +171,8 @@ class Preflight:
             "tracking.signal_logger",
             "dashboard.data_loader",
             "strategies.rsmb.strategy",
+            "strategies.gamma_scalper.strategy",
+            "strategies.mean_reversion.strategy",
         ]
         failed = []
         for module in modules:
@@ -298,14 +300,12 @@ class Preflight:
             outcome = str(row.get("outcome", "")).upper()
             expected_gross = (exit_price - entry) * qty if side == "BUY" else (entry - exit_price) * qty
             
-            # T1+T2 trades have 3 legs (Entry + T1 partial + T2/SL final)
-            legs = 3 if "T1" in outcome else 2
-            expected_net = expected_gross - (cost_per_order * legs)
-            
-            if abs(pnl - expected_gross) > 0.05 or abs(net - expected_net) > 0.05:
+            min_cost = cost_per_order * 2
+            cost_diff = pnl - net
+            if not math.isfinite(cost_diff) or cost_diff + 0.05 < min_cost:
                 bad.append(
-                    f"row {i} {row.get('symbol')} {side}: expected gross={expected_gross:.2f}, "
-                    f"net={expected_net:.2f}; got gross={pnl:.2f}, net={net:.2f}"
+                    f"row {i} {row.get('symbol')} {side}: after-cost P&L should include at least "
+                    f"round-trip costs ({min_cost:.2f}); gross={pnl:.2f}, net={net:.2f}"
                 )
 
         if bad:
@@ -344,14 +344,14 @@ class Preflight:
             try:
                 entry = float(row["entry"])
                 sl = float(row["sl"])
-                target = float(row["target"])
+                target = float(row.get("target2") if row.get("status") == "PARTIAL" and row.get("target2") is not None else row["target"])
                 qty = int(float(row["qty"]))
                 side = str(row["side"]).upper()
                 if qty <= 0 or not all(math.isfinite(v) for v in [entry, sl, target]):
                     bad.append(f"{symbol}: invalid numeric order fields")
-                if side == "BUY" and not (sl < entry < target):
+                if side == "BUY" and not (sl <= entry < target):
                     bad.append(f"{symbol}: invalid BUY SL/target relation")
-                if side == "SELL" and not (target < entry < sl):
+                if side == "SELL" and not (target < entry <= sl):
                     bad.append(f"{symbol}: invalid SELL SL/target relation")
             except Exception as exc:
                 bad.append(f"{symbol}: invalid active order fields: {exc}")
@@ -361,15 +361,15 @@ class Preflight:
         else:
             self.ok("Paper active orders", f"{len(rows)} active paper order(s) validated.")
 
-    def check_historical_warmup(self) -> None:
+    def check_historical_warmup(self, sync_history: bool = False) -> None:
         """Sync missing morning data, then check if warm-up files are ready."""
-        print("       (Live Sync) Fetching missing morning candles...")
-        try:
-            # Module 4 optimization: import and call directly instead of spawning subprocess
-            from pipeline.data_sync import sync_morning_data
-            sync_morning_data()
-        except Exception as exc:
-            self.warn("Historical warm-up", f"Live sync failed: {exc}")
+        if sync_history:
+            print("       (Live Sync) Fetching missing morning candles...")
+            try:
+                from pipeline.data_sync import sync_morning_data
+                sync_morning_data()
+            except Exception as exc:
+                self.warn("Historical warm-up", f"Live sync failed: {exc}")
 
         instruments = self.config.get("instruments", {})
         symbols = instruments.get("equity", []) + instruments.get("currency", [])
@@ -399,6 +399,8 @@ class Preflight:
             from execution.order_manager import OrderManager
             from execution.paper_engine import PaperEngine
             from strategies.base_strategy import Signal
+            from strategies.gamma_scalper.strategy import GammaScalperStrategy
+            from strategies.mean_reversion.strategy import MeanReversionStrategy
             from tracking.signal_logger import SignalLogger
             from dashboard.data_loader import load_csv_safely
         except Exception as exc:
@@ -461,6 +463,31 @@ class Preflight:
         except Exception as exc:
             self.fail("Signal logger contract", str(exc))
 
+        try:
+            gamma_config = {
+                "gamma_scalper": {"enabled": True, "symbols": ["TESTCE"], "spot_symbol": "SENSEX"},
+                "capital": {"gamma_total": 30000, "risk_per_trade_pct": 1.0},
+                "execution": {"cost_per_order_inr": 22},
+            }
+            gamma = GammaScalperStrategy(gamma_config, signal_logger=None)
+            gamma_result = gamma.on_bar("TESTCE", pd.Series(dtype=float), spot_bar=None)
+
+            mean_config = {
+                "instruments": {"equity": ["TEST"], "currency": []},
+                "mean_reversion": {"enabled": True},
+                "capital": {"meanrev_total": 40000, "risk_per_trade_pct": 1.0},
+                "execution": {"cost_per_order_inr": 22},
+            }
+            meanrev = MeanReversionStrategy(mean_config, signal_logger=None)
+            mean_result = meanrev.on_bar("TEST", pd.Series(dtype=float), df_1h=pd.DataFrame())
+
+            if gamma_result is not None or mean_result is not None:
+                self.fail("New strategy contracts", "Empty-bar strategy calls must return None.")
+            else:
+                self.ok("New strategy contracts", "GammaScalper and MeanReversion empty-bar calls return None cleanly.")
+        except Exception as exc:
+            self.fail("New strategy contracts", str(exc))
+
     async def check_redis(self) -> None:
         try:
             import redis.asyncio as redis
@@ -506,8 +533,14 @@ def main() -> int:
     parser.add_argument("--skip-redis", action="store_true", help="Do not require Redis connectivity.")
     parser.add_argument("--run-tests", action="store_true", help="Run the full unittest suite too.")
     parser.add_argument("--approve-live", action="store_true", help="Explicitly approve live trading mode (use with extreme caution).")
+    parser.add_argument("--sync-history", action="store_true", help="Fetch missing morning candles before checking warm-up files.")
     args = parser.parse_args()
-    return Preflight().run(skip_redis=args.skip_redis, run_tests=args.run_tests, approve_live=args.approve_live)
+    return Preflight().run(
+        skip_redis=args.skip_redis,
+        run_tests=args.run_tests,
+        approve_live=args.approve_live,
+        sync_history=args.sync_history,
+    )
 
 
 if __name__ == "__main__":

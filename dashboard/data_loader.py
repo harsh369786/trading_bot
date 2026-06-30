@@ -90,7 +90,7 @@ def calculate_advanced_metrics(df: pd.DataFrame, pnl_col: str = "pnl_after_costs
     win_rate = round((df[pnl_col] > 0).sum() / len(df) * 100, 2) if len(df) else 0.0
 
     # Max Drawdown Calculation
-    df_sorted = df.sort_values("date") if "date" in df.columns else df.sort_index()
+    df_sorted = (df.sort_values("date") if "date" in df.columns else df.sort_index()).copy()
     cum_pnl = df_sorted[pnl_col].cumsum()
     peak = cum_pnl.cummax()
     drawdown = peak - cum_pnl

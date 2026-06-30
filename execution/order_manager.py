@@ -52,6 +52,23 @@ class OrderManager:
             return
         await self.redis.set(self.KEY_ACTIVE, json.dumps(orders, default=str))
 
+    async def _acquire_symbol_lock(self, symbol: str) -> bool:
+        if not self.redis:
+            return True
+        try:
+            return bool(await self.redis.set(f"bot:lock:order:{symbol}", "1", nx=True, ex=10))
+        except TypeError:
+            # Test fakes may not implement NX; production Redis does.
+            return True
+
+    async def _release_symbol_lock(self, symbol: str) -> None:
+        if not self.redis:
+            return
+        try:
+            await self.redis.delete(f"bot:lock:order:{symbol}")
+        except AttributeError:
+            pass
+
     async def reconcile_startup_state(self):
         """
         Clean stale or incompatible persisted orders before accepting new signals.
@@ -112,6 +129,11 @@ class OrderManager:
     def _domain_for_symbol(self, symbol: str) -> str:
         currency_symbols = set(self.config.get("instruments", {}).get("currency", []))
         return "currency" if symbol in currency_symbols else "equity"
+
+    @staticmethod
+    def _is_paper_fallback_strategy(strategy: str | None) -> bool:
+        strategy_name = str(strategy or "")
+        return strategy_name.endswith("_PAPER_RELAXED") or strategy_name.endswith("_PAPER_TECHNICAL")
 
     def _normalize_signal(self, signal: dict) -> dict | None:
         """Normalize old/new signal field names into one safe order schema."""
@@ -193,46 +215,58 @@ class OrderManager:
         side = signal["side"]
         domain = signal["domain"]
 
-        if not await self.risk_engine.check_circuit_breakers(domain):
-            logger.warning(f"Risk engine blocked {domain} signal for {symbol}.")
+        lock_acquired = await self._acquire_symbol_lock(symbol)
+        if not lock_acquired:
+            logger.warning(f"Skipping signal for {symbol}: order lock already held.")
             return
 
-        active_orders = await self._get_active_orders()
-        for active in active_orders.values():
-            if active.get("symbol") == symbol and active.get("status") in ["PENDING", "PROTECTED"]:
-                logger.warning(f"Skipping signal for {symbol}: trade already active.")
+        try:
+            if not await self.risk_engine.check_circuit_breakers(domain):
+                logger.warning(f"Risk engine blocked {domain} signal for {symbol}.")
                 return
 
-        logger.info(f"Executing {side} on {symbol} | Qty: {signal['qty']}")
+            active_orders = await self._get_active_orders()
+            for active in active_orders.values():
+                if active.get("symbol") == symbol and active.get("status") in ["PENDING", "PROTECTED"]:
+                    logger.warning(f"Skipping signal for {symbol}: trade already active.")
+                    return
 
-        entry_res = self.broker.place_order(
-            symbol=symbol,
-            qty=signal["qty"],
-            direction=side,
-            order_type="MARKET" if self.paper_mode else "LIMIT",
-            price=signal["entry"],
-        )
+            logger.info(f"Executing {side} on {symbol} | Qty: {signal['qty']}")
 
-        if entry_res.get("status") != "SUCCESS":
-            logger.error(f"Entry failed for {symbol}: {entry_res.get('reason') or entry_res.get('message')}")
-            return
+            entry_res = self.broker.place_order(
+                symbol=symbol,
+                qty=signal["qty"],
+                direction=side,
+                order_type="MARKET" if self.paper_mode else "LIMIT",
+                price=signal["entry"],
+            )
 
-        order_id = entry_res["order_id"]
-        active = await self._get_active_orders()
-        active[order_id] = {**signal, "status": "PENDING", "order_id": order_id}
-        await self._save_active_orders(active)
-        await self.risk_engine.update_stats(domain, trade_delta=1)
+            if entry_res.get("status") != "SUCCESS":
+                logger.error(f"Entry failed for {symbol}: {entry_res.get('reason') or entry_res.get('message')}")
+                return
 
-        logger.info(f"Entry order {order_id} placed. Waiting for fill...")
+            order_id = entry_res["order_id"]
+            active = await self._get_active_orders()
+            active[order_id] = {**signal, "status": "PENDING", "order_id": order_id}
+            await self._save_active_orders(active)
+            await self.risk_engine.update_stats(
+                domain,
+                trade_delta=1,
+                count_daily_trade=not self._is_paper_fallback_strategy(signal.get("strategy")),
+            )
 
-        if self.paper_mode:
-            logger.debug(f"Paper mode: simulating immediate fill for {order_id}")
-            await self.handle_order_update({
-                "order_id": order_id,
-                "status": "FILLED",
-                "price": entry_res.get("fill_price", signal["entry"]),
-                "is_exit": False,
-            })
+            logger.info(f"Entry order {order_id} placed. Waiting for fill...")
+
+            if self.paper_mode:
+                logger.debug(f"Paper mode: simulating immediate fill for {order_id}")
+                await self.handle_order_update({
+                    "order_id": order_id,
+                    "status": "FILLED",
+                    "price": entry_res.get("fill_price", signal["entry"]),
+                    "is_exit": False,
+                })
+        finally:
+            await self._release_symbol_lock(symbol)
 
     def _ensure_journal_header(self):
         """Write CSV header exactly once when the file doesn't yet exist (C5 fix)."""
@@ -438,14 +472,19 @@ class OrderManager:
         label = f"{domain} " if domain else ""
         logger.warning(f"OrderManager: Squaring off {len(active_items)} active {label}positions (EOD).")
         for oid, trade in active_items:
-            exit_price = trade.get("last_price") or trade.get("entry")
+            symbol = trade.get("symbol", "UNKNOWN")
+            exit_price = trade.get("last_price") or trade.get("fill_price") or trade.get("entry")
             if self.redis is not None:
                 try:
-                    raw = await self.redis.get(f"bot:ltp:{trade['symbol']}")
+                    raw = await self.redis.get(f"bot:ltp:{symbol}")
                     if raw is not None:
                         exit_price = float(raw)
+                    else:
+                        logger.warning(
+                            f"No Redis LTP for {symbol} at EOD; using fallback exit_price={exit_price}"
+                        )
                 except (TypeError, ValueError, KeyError) as exc:
-                    logger.warning(f"Could not read latest LTP for {trade.get('symbol')}: {exc}")
+                    logger.warning(f"Could not read latest LTP for {symbol}: {exc}")
             await self.handle_order_update({
                 "order_id": oid,
                 "status": "EOD_SQUAREOFF",

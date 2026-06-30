@@ -16,22 +16,36 @@ class WebSocketFeed:
     """
     Connects to the broker WebSocket or mock simulator and publishes ticks to Redis.
     """
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, redis_queue=None):
         self.config = config
-        self.redis_queue = RedisQueue()
+        self.redis_queue = redis_queue or RedisQueue()
+        self._owns_redis_queue = redis_queue is None
         self.max_retries = 3
         self.ist = pytz.timezone("Asia/Kolkata")
-        self.symbols = config.get("instruments", {}).get("equity", []) + config.get("instruments", {}).get("currency", [])
+        instruments = config.get("instruments", {})
+        gamma_cfg = config.get("gamma_scalper", {})
+        gamma_symbols = list(gamma_cfg.get("symbols", []) or [])
+        gamma_spot = gamma_cfg.get("spot_symbol", "SENSEX")
+        configured_symbols = (
+            instruments.get("equity", [])
+            + instruments.get("currency", [])
+            + gamma_symbols
+            + ([gamma_spot] if gamma_symbols and gamma_spot else [])
+        )
+        self.symbols = list(dict.fromkeys(configured_symbols))
         self.ws_url = os.environ.get("BROKER_WS_URL", "wss://example.broker.com/stream")
         self.api_key = os.environ.get("BROKER_API_KEY", "")
         self.exchange_type_map = {
             "NSE": 1,
             "NFO": 2,
+            "BSE": 3,
+            "BFO": 4,
             "CDS": 13,
             "CDE_FO": 13,
         }
         self.resolved_token_map = {}
         self.symbol_exchange_map = {}
+        self._last_cumulative_volume = {}
 
     async def send_telegram_alert(self, message: str):
         logger.error(f"TELEGRAM ALERT: {message}")
@@ -54,6 +68,53 @@ class WebSocketFeed:
             return 0.0
         divisor = 10000000.0 if str(exchange).upper() == "CDS" else 100.0
         return value / divisor
+
+    @staticmethod
+    def _first_positive_int(tick: dict, keys: list[str]) -> int:
+        """Return the first positive integer-like field from a broker tick."""
+        for key in keys:
+            try:
+                value = int(float(tick.get(key, 0) or 0))
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return value
+        return 0
+
+    def _extract_volume_delta(self, symbol: str, tick: dict) -> int:
+        """
+        Extract per-tick volume from Angel One ticks.
+
+        SmartAPI commonly sends cumulative day volume as
+        `volume_trade_for_the_day`, not `volume_traded`. Candles need interval
+        volume, so convert cumulative values to deltas and fall back to LTQ.
+        """
+        cumulative = self._first_positive_int(
+            tick,
+            [
+                "volume_trade_for_the_day",
+                "volume_traded_today",
+                "total_traded_volume",
+                "total_trade_quantity",
+            ],
+        )
+        if cumulative > 0:
+            previous = self._last_cumulative_volume.get(symbol)
+            self._last_cumulative_volume[symbol] = cumulative
+            if previous is None or cumulative < previous:
+                return 0
+            return max(0, cumulative - previous)
+
+        return self._first_positive_int(
+            tick,
+            [
+                "volume_traded",
+                "last_traded_quantity",
+                "last_traded_qty",
+                "ltq",
+                "trade_quantity",
+            ],
+        )
 
     async def connect_and_stream(self):
         if self.ws_url.startswith("mock://"):
@@ -96,8 +157,15 @@ class WebSocketFeed:
 
         logger.info("Resolving live tokens from master contract...")
         equity_symbols = set(self.config.get("instruments", {}).get("equity", []))
+        gamma_symbols = set(self.config.get("gamma_scalper", {}).get("symbols", []) or [])
+        gamma_spot = self.config.get("gamma_scalper", {}).get("spot_symbol", "SENSEX")
         for sym in self.symbols:
-            exchange = "NSE" if sym in equity_symbols else "CDE_FO"
+            if sym in gamma_symbols:
+                exchange = "BFO"
+            elif sym == gamma_spot:
+                exchange = "BSE"
+            else:
+                exchange = "NSE" if sym in equity_symbols else "CDE_FO"
             token, exch, full_name = AngelOneMaster.get_token(sym, exchange)
             if token:
                 logger.info(f"Resolved {sym} -> {full_name} (Token: {token})")
@@ -151,7 +219,7 @@ class WebSocketFeed:
                         "symbol": symbol,
                         "timestamp": datetime.now(self.ist).isoformat(),
                         "ltp": ltp,
-                        "volume": int(tick.get("volume_traded", 0)),
+                        "volume": self._extract_volume_delta(symbol, tick),
                         "bid": self._normalize_price(tick.get("best_bid_price", 0), exchange),
                         "ask": self._normalize_price(tick.get("best_ask_price", 0), exchange),
                         "oi": int(tick.get("open_interest", 0)),
@@ -168,9 +236,19 @@ class WebSocketFeed:
         def on_error(wsapp, error):
             logger.error(f"Angel One WS error: {error}")
 
+        def on_close(wsapp, close_status_code, close_msg):
+            logger.warning(f"Angel One WS closed: {close_status_code} - {close_msg}")
+
         sws.on_open = on_open
         sws.on_data = on_data
         sws.on_error = on_error
+        sws.on_close = on_close
+
+        # Monkey patch to fix SmartApi library bug (takes 2 positional arguments but 4 were given)
+        def _patched_on_close(wsapp, close_status_code, close_msg):
+            if sws.on_close:
+                sws.on_close(wsapp, close_status_code, close_msg)
+        sws._on_close = _patched_on_close
 
         # Use a daemon thread so the blocking sws.connect() runs independently
         # of asyncio's ThreadPoolExecutor. This prevents "Executor shutdown has
@@ -178,14 +256,19 @@ class WebSocketFeed:
         stop_event = asyncio.Event()
 
         def _run_ws():
-            try:
-                sws.connect()
-            except Exception as exc:
-                logger.error(f"Angel One WS thread exited with error: {exc}")
-            finally:
-                # Signal the asyncio coroutine that the WS thread has stopped
-                if main_loop.is_running():
-                    main_loop.call_soon_threadsafe(stop_event.set)
+            import time
+            consecutive_errors = 0
+            while not stop_event.is_set():
+                try:
+                    sws.connect()
+                    # If connect() returns, connection was closed
+                    logger.warning("Angel One WS disconnected. Reconnecting in 5s...")
+                    time.sleep(5)
+                except Exception as exc:
+                    consecutive_errors += 1
+                    backoff = min(60, 2 ** consecutive_errors)
+                    logger.error(f"Angel One WS thread error: {exc}. Retrying in {backoff}s...")
+                    time.sleep(backoff)
 
         ws_thread = threading.Thread(target=_run_ws, daemon=True, name="angelone-ws")
         ws_thread.start()
@@ -223,7 +306,7 @@ class WebSocketFeed:
         }
         for symbol in self.symbols:
             path = os.path.join("data", "historical", f"{symbol}_6m.parquet")
-            if symbol in base_prices or not os.path.exists(path):
+            if not os.path.exists(path):
                 continue
             try:
                 hist = pd.read_parquet(path, columns=["close"])
@@ -260,8 +343,10 @@ class WebSocketFeed:
 
         if not any(self._is_symbol_market_open(symbol) for symbol in self.symbols):
             logger.warning("Markets are closed for all configured symbols. Shutting down feed.")
-            await self.redis_queue.close()
+            if self._owns_redis_queue:
+                await self.redis_queue.close()
             return
 
         await self.connect_and_stream()
-        await self.redis_queue.close()
+        if self._owns_redis_queue:
+            await self.redis_queue.close()

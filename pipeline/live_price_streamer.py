@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 import collections
+import os
 from loguru import logger
 from typing import Dict, Any, Deque
 from .redis_queue import RedisQueue
@@ -13,7 +14,17 @@ class LivePriceStreamer:
     """
     def __init__(self, config: dict, redis_queue=None):
         self.config = config
-        self.symbols = config.get("instruments", {}).get("equity", []) + config.get("instruments", {}).get("currency", [])
+        instruments = config.get("instruments", {})
+        gamma_cfg = config.get("gamma_scalper", {})
+        gamma_symbols = list(gamma_cfg.get("symbols", []) or [])
+        gamma_spot = gamma_cfg.get("spot_symbol", "SENSEX")
+        configured_symbols = (
+            instruments.get("equity", [])
+            + instruments.get("currency", [])
+            + gamma_symbols
+            + ([gamma_spot] if gamma_symbols and gamma_spot else [])
+        )
+        self.symbols = list(dict.fromkeys(configured_symbols))
         self.redis_queue = redis_queue
         # In-memory buffer of last 500 ticks per symbol
         self.tick_buffers: Dict[str, Deque[Dict[str, Any]]] = {
@@ -26,8 +37,11 @@ class LivePriceStreamer:
 
     def _init_db(self):
         """Initialize SQLite database for ticks."""
-        conn = sqlite3.connect(self.sqlite_db_path)
+        os.makedirs(os.path.dirname(self.sqlite_db_path) or ".", exist_ok=True)
+        conn = sqlite3.connect(self.sqlite_db_path, timeout=30)
         cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS ticks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,7 +63,7 @@ class LivePriceStreamer:
             return
             
         try:
-            conn = sqlite3.connect(self.sqlite_db_path)
+            conn = sqlite3.connect(self.sqlite_db_path, timeout=30)
             cursor = conn.cursor()
             
             # Prepare data for bulk insert

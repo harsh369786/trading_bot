@@ -26,3 +26,4 @@ pandas
 smartapi-python
 fastapi
 uvicorn
+imbalanced-learn

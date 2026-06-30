@@ -5,7 +5,7 @@ from loguru import logger
 
 class BaseBroker(ABC):
     @abstractmethod
-    def place_order(self, symbol: str, qty: int, direction: str, order_type: str, price: float = None) -> dict:
+    def place_order(self, symbol: str, qty: int, direction: str, order_type: str, price: float = None, **kwargs) -> dict:
         pass
 
     @abstractmethod
@@ -46,9 +46,54 @@ class AngelOneBroker(BaseBroker):
         else:
             logger.error(f"Angel One: Login failed: {self.session_data.get('message')}")
 
-    def place_order(self, symbol: str, qty: int, direction: str, order_type: str, price: float = None) -> dict:
-        logger.error("Angel One live place_order is not implemented. Refusing to fake a live order.")
-        return {"status": "FAILED", "reason": "AngelOneBroker.place_order is not implemented"}
+    def place_order(self, symbol: str, qty: int, direction: str, order_type: str, price: float = None, **kwargs) -> dict:
+        if not self.session_data:
+            logger.error("Angel One: Not logged in. Cannot place order.")
+            return {"status": "FAILED", "reason": "Not logged in"}
+            
+        try:
+            from utils.broker_utils import AngelOneMaster
+            token, mapped_exchange, tradingsymbol = AngelOneMaster.get_token(symbol)
+            if not token:
+                logger.error(f"Angel One: Could not resolve token for {symbol}")
+                return {"status": "FAILED", "reason": f"Unknown symbol {symbol}"}
+                
+            orderparams = {
+                "variety": "NORMAL",
+                "tradingsymbol": tradingsymbol,
+                "symboltoken": str(token),
+                "transactiontype": direction,
+                "exchange": mapped_exchange or kwargs.get("exchange", "NSE"),
+                "ordertype": order_type,
+                "producttype": "INTRADAY",
+                "duration": "DAY",
+                "quantity": str(qty)
+            }
+            if order_type in ["LIMIT", "STOPLOSS_LIMIT"] and price:
+                orderparams["price"] = str(price)
+            if order_type in ["STOPLOSS_MARKET", "STOPLOSS_LIMIT"] and kwargs.get("trigger_price"):
+                orderparams["triggerprice"] = str(kwargs.get("trigger_price"))
+                orderparams["variety"] = "STOPLOSS"
+                
+            response = self.smart_api.placeOrder(orderparams)
+            
+            if response and response.get('status'):
+                order_id = response.get('data') or "UNKNOWN_ID"
+                logger.info(f"Angel One: Live order placed successfully. ID: {order_id}")
+                return {
+                    "status": "SUCCESS",
+                    "order_id": order_id,
+                    "fill_price": price,
+                    "timestamp": datetime.now()
+                }
+            else:
+                err = response.get('message', 'Unknown API error') if response else "Empty response"
+                logger.error(f"Angel One: Order failed: {err}")
+                return {"status": "FAILED", "reason": err}
+                
+        except Exception as e:
+            logger.error(f"Angel One: place_order exception: {e}")
+            return {"status": "FAILED", "reason": str(e)}
 
     def cancel_order(self, order_id: str) -> bool:
         logger.info(f"Angel One: Cancelling order {order_id}")
@@ -70,7 +115,7 @@ class MockBroker(BaseBroker):
         self.orders = {}
         self.positions = []
 
-    def place_order(self, symbol: str, qty: int, direction: str, order_type: str, price: float = None) -> dict:
+    def place_order(self, symbol: str, qty: int, direction: str, order_type: str, price: float = None, **kwargs) -> dict:
         order_id = f"MOCK-{random.randint(10000, 99999)}"
         
         # Simulate Slippage (0.01% - 0.05%)

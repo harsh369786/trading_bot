@@ -115,6 +115,7 @@ def compute_position_size(
     entry: float,
     stop_loss: float,
     risk_capital: float,
+    max_notional: float | None = None,
 ) -> int:
     """
     floor(risk_capital / abs(entry - stop_loss))
@@ -126,6 +127,8 @@ def compute_position_size(
         logger.warning("compute_position_size: SL == entry, cannot size position")
         return 0
     qty = math.floor(risk_capital / distance)
+    if max_notional is not None and max_notional > 0 and entry > 0:
+        qty = min(qty, math.floor(max_notional / entry))
     return max(0, qty)
 
 
@@ -142,6 +145,7 @@ def evaluate_buy_signal(
     vix_veto: bool,
     risk_capital: float,
     cost_per_order_inr: float = 22.0,
+    max_notional: float | None = None,
 ) -> Optional[Signal]:
     """
     Evaluate all 9 BUY conditions for RSMB.
@@ -237,7 +241,7 @@ def evaluate_buy_signal(
     risk = entry - sl
     target1 = entry + (1.5 * risk)
     target2 = entry + (3.0 * risk)
-    qty = compute_position_size(entry, sl, risk_capital)
+    qty = compute_position_size(entry, sl, risk_capital, max_notional=max_notional)
 
     if qty <= 0:
         return _rejected(symbol, "BUY", rs_rank, "qty_zero_risk_too_large")
@@ -272,6 +276,7 @@ def evaluate_sell_signal(
     vix_veto: bool,
     risk_capital: float,
     cost_per_order_inr: float = 22.0,
+    max_notional: float | None = None,
 ) -> Optional[Signal]:
     """
     Evaluate all 6 SELL conditions for RSMB (short via F&O).
@@ -340,7 +345,7 @@ def evaluate_sell_signal(
     risk = sl - entry
     target1 = entry - (1.5 * risk)
     target2 = entry - (3.0 * risk)
-    qty = compute_position_size(entry, sl, risk_capital)
+    qty = compute_position_size(entry, sl, risk_capital, max_notional=max_notional)
 
     if qty <= 0:
         return _rejected(symbol, "SELL", rs_rank, "qty_zero_risk_too_large")
@@ -380,5 +385,6 @@ def _rejected(
     Log a rejection and return None.
     Returns None so callers can do: return _rejected(...).
     """
-    logger.debug(f"RSMB {side} {symbol}: REJECTED [{reason}] rs={rs_rank:.3f}")
+    rs_str = f"{rs_rank:.3f}" if not math.isnan(rs_rank) else "NaN"
+    logger.debug(f"RSMB {side} {symbol}: REJECTED [{reason}] rs={rs_str}")
     return None

@@ -6,6 +6,15 @@ broker:
 
 paper_mode: true                    # ALWAYS start true; set TRADING_MODE=live in .env to override
 
+paper_trading:
+  relaxed_signals: false             # paper-only relaxed AI fallback disabled after poor win rate
+  equity_min_confidence: 0.30       # paper-only fallback; still requires timing-quality gate
+  equity_technical_min_score: 4.25  # paper-only technical fallback must have strong alignment
+  equity_signal_cooldown_minutes: 45
+  technical_fallback_enabled: true
+  currency_min_conditions: 4        # paper-only fallback when scanner is one condition short
+  bypass_currency_quant: false      # do not bypass QuantValidator now that feature names are fixed
+
 execution:
   cost_per_order_inr: 22            # ₹20 brokerage + ₹2 exchange/SEBI (flat-fee brokers)
   cost_fraction_per_side: 0.0003    # secondary estimate for large notional positions
@@ -13,6 +22,8 @@ execution:
 capital:
   equity_total: 50000
   currency_total: 25000
+  gamma_total: 30000
+  meanrev_total: 40000
   risk_per_trade_pct: 1.0           # 1% of capital per trade (full size, uncorrelated pair)
   risk_per_trade_correlated_pct: 0.65  # used when NIFTY+BANKNIFTY are open simultaneously
   max_open_trades_equity: 2
@@ -27,10 +38,16 @@ instruments:
   correlation_threshold: 0.75      # above this → treat as one position, use correlated risk %
 
 equity_signal:
-  min_buy_confidence: 0.62          # raised from 0.40 — filters near-random signals
-  min_sell_confidence: 0.62         # raised from 0.40
+  min_buy_confidence: 0.38
+  min_sell_confidence: 0.38
+  min_ai_confidence_floor: 0.25
   min_relative_volume: 0.7
+  min_adx: 16
   max_vix: 20.0
+  performance_guard_enabled: true
+  performance_guard_min_trades: 5
+  performance_guard_min_win_rate: 0.35
+  performance_guard_min_profit_factor: 0.80
 
 currency_signal:
   conditions_required: 4
@@ -47,10 +64,35 @@ risk:
   atr_sl_multiplier: 2.0            # raised from 1.5 — reduces premature SL hits on NSE volatility
   rr_ratio: 2.5
   max_vix_spike: 25.0
+  equity_max_daily_trades: 6
   currency_max_daily_loss_inr: 750  # tightened from 1500 (was 6% of currency capital; now 3%)
-  currency_max_daily_trades: 5
+  currency_max_daily_trades: 4
+  gamma_max_daily_loss_inr: 3000
+  gamma_max_open_trades: 2
+  meanrev_max_daily_loss_inr: 2000
+  meanrev_max_open_trades: 3
+
+gamma_scalper:
+  enabled: true                     # enable only after configuring live Sensex ATM option symbols
+  symbols: ["SENSEX2652175700CE", "SENSEX2652175700PE"] # current ATM CE/PE Angel One symbols resolved from master contract
+  spot_symbol: "SENSEX"
+  min_candle_strength: 10.0
+  min_ai_score: 0.70
+  min_adx: 20
+  max_open_trades: 2
+  theta_veto_bars: 3
+
+mean_reversion:
+  enabled: false
+  min_ai_score: 0.60
+  max_adx: 35
+  min_distance_pct: 3.0
+  wick_ratio_min: 2.0
+  max_open_trades: 3
 
 model:
+  auto_retrain_on_startup: true     # automatically retrain if model metadata is stale/incompatible
+  startup_retrain_cooldown_hours: 24 # avoid repeating expensive failed/rejected retrains every restart
   # Session-aware model blending — avoids feeding LSTM flat/choppy data
   weights_by_session:
     open_drive:                     # 09:15–11:30: momentum readable, balanced blend
@@ -63,6 +105,13 @@ model:
       xgb: 0.45
       lstm: 0.55
   retrain_schedule: "weekly"
+
+training:
+  history_days: 730                # one-time Angel One backfill target
+  minimum_history_days: 365        # warn/backfill when coverage is shorter
+  incremental_sync_days: 14        # normal weekly refresh window
+  schedule_day: "Friday"
+  schedule_time: "17:15"
 
 adaptive_learning:
   min_trades_before_change: 40      # raised from 15 — 40+ gives statistically stable estimates
@@ -81,12 +130,18 @@ session:
   equity_cutoff: "15:15"
 
 notifications:
-  channel: ""                       # or "email", "whatsapp", "telegram"
+  channel: "email"                  # or "email", "whatsapp", "telegram"
+  smtp_host: ""                     # from .env: SMTP_HOST or NOTIFY_SMTP_HOST
+  smtp_port: ""                     # from .env: SMTP_PORT or NOTIFY_SMTP_PORT, default 587
+  smtp_user: ""                     # from .env: SMTP_USER or NOTIFY_EMAIL_FROM
+  smtp_password: ""                 # from .env: SMTP_PASSWORD or NOTIFY_EMAIL_PASSWORD
+  email_from: ""                    # from .env: EMAIL_FROM or NOTIFY_EMAIL_FROM
+  email_to: ""                      # from .env: EMAIL_TO / REPORT_EMAIL_TO / MAIL_TO / NOTIFY_EMAIL_TO
   telegram_token: ""                # from .env
   telegram_chat_id: ""             # from .env
 
 logging:
-  console_level: "SUCCESS"         # SUCCESS, INFO, DEBUG, WARNING, ERROR
+  console_level: "INFO"            # SUCCESS, INFO, DEBUG, WARNING, ERROR
   file_level: "DEBUG"
   retention_days: 45               # raised from 10 — covers full month + buffer for analysis
   max_file_size_mb: 50

@@ -192,7 +192,7 @@ def get_active_orders():
     rows = []
     try:
         import redis
-        url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+        url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
         client = redis.Redis.from_url(url, decode_responses=True,
                                        socket_connect_timeout=1, socket_timeout=1)
         raw = client.get(ACTIVE_ORDER_KEY)
